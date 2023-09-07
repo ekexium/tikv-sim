@@ -72,19 +72,19 @@ fn main() {
     let mut model = Model {
         events: events.clone(),
         servers: vec![
-            Server::new(Role::Leader, Zone::AZ1, events.clone(), 4),
-            Server::new(Role::Follower, Zone::AZ2, events.clone(), 4),
-            Server::new(Role::Follower, Zone::AZ3, events.clone(), 4),
+            Server::new(Role::Leader, Zone::AZ1, events.clone(), 4, SECOND),
+            Server::new(Role::Follower, Zone::AZ2, events.clone(), 4, SECOND),
+            Server::new(Role::Follower, Zone::AZ3, events.clone(), 4, SECOND),
         ],
         clients: vec![
             Client::new(Zone::AZ1, events.clone()),
             Client::new(Zone::AZ2, events.clone()),
             Client::new(Zone::AZ3, events.clone()),
         ],
-        app: App::new(events.clone(), 3_000.0),
+        app: App::new(events.clone(), 1000.0),
     };
 
-    model.app.gen();
+    model.app.gen_txn();
     let max_time = 60 * SECOND;
 
     loop {
@@ -115,12 +115,25 @@ fn main() {
             .sum::<u64>()
     );
 
+    println!(
+        "finished {} transactions, {} still in flight",
+        model.app.txn_duration_stat.len(),
+        model.app.pending_transactions.len()
+    );
+
+    println!(
+        "txn duration mean: {}, p99: {}",
+        (model.app.txn_duration_stat.mean() as u64).pretty_print(),
+        (model.app.txn_duration_stat.value_at_quantile(0.99) as u64).pretty_print()
+    );
+
     for client in model.clients {
         println!(
-            "client {:?} mean: {}, p99: {}",
+            "client {:?} mean: {}, p99: {}, {} errors",
             client.id,
             (client.latency_stat.mean() as u64).pretty_print(),
-            (client.latency_stat.value_at_quantile(0.99) as u64).pretty_print()
+            (client.latency_stat.value_at_quantile(0.99) as u64).pretty_print(),
+            client.error_latency_stat.len(),
         );
     }
 
@@ -170,8 +183,8 @@ enum Zone {
 }
 
 impl Zone {
-    fn from_id(id: u64) -> Zone {
-        match id {
+    fn rand_zone() -> Self {
+        match rand::random::<u64>() % 3 {
             0 => Zone::AZ1,
             1 => Zone::AZ2,
             2 => Zone::AZ3,
@@ -190,14 +203,16 @@ struct Server {
     zone: Zone,
     server_id: u64,
     events: Events,
-    // Vec<(time when enqueue, task)>
+    // Vec<(accept time, task)>
     task_queue: VecDeque<(Time, Request)>,
     workers: Vec<Option<Request>>,
     schedule_wait_stat: Histogram<Time>,
+    // a read request will abort at this time if it cannot finish in time
+    read_timeout: Time,
 }
 
 impl Server {
-    fn new(role: Role, zone: Zone, events: Events, num_workers: usize) -> Self {
+    fn new(role: Role, zone: Zone, events: Events, num_workers: usize, read_timeout: Time) -> Self {
         Self {
             server_id: SERVER_COUNTER.fetch_add(1, atomic::Ordering::SeqCst),
             role,
@@ -207,10 +222,11 @@ impl Server {
             workers: vec![None; num_workers],
             schedule_wait_stat: Histogram::<Time>::new_with_bounds(NANOSECOND, 60 * SECOND, 3)
                 .unwrap(),
+            read_timeout,
         }
     }
 
-    fn on_req(&mut self, task: Request) {
+    fn on_req(&mut self, mut task: Request) {
         if self.workers.iter().all(|w| w.is_some()) {
             // busy
             self.task_queue.push_back((now(), task));
@@ -219,30 +235,56 @@ impl Server {
         self.schedule_wait_stat.record(0).unwrap();
         // some work is idle, schedule now
         let worker_id = self.workers.iter().position(|w| w.is_none()).unwrap();
-        let task_size = task.size;
-        self.workers[worker_id] = Some(task);
+        self.schedule_to_worker(worker_id, task, now());
+    }
 
-        // prepare for wakeup event
-        let current_time = now();
+    // a worker is idle, schedule a task onto it now.
+    fn schedule_to_worker(&mut self, worker_id: usize, req: Request, accept_time: Time) {
+        assert!(self.workers[worker_id].is_none());
+        let task_size = req.size;
+        self.workers[worker_id] = Some(req);
         let this_server_id = self.server_id;
+
+        if accept_time + self.read_timeout > now() + task_size {
+            self.events.borrow_mut().push(Event::new(
+                now() + self.read_timeout,
+                EventType::ReadRequestTimeout,
+                Box::new(move |model: &mut Model| {
+                    let this = model.find_server_by_id(this_server_id);
+                    let task = this.workers[worker_id].take().unwrap();
+                    if let Some((accept_time, task)) = this.task_queue.pop_front() {
+                        this.schedule_wait_stat.record(now() - accept_time).unwrap();
+                        this.schedule_to_worker(worker_id, task, accept_time);
+                    }
+                    model.events.borrow_mut().push(Event::new(
+                        now() + rpc_latency(false),
+                        EventType::Response,
+                        Box::new(move |model: &mut Model| {
+                            model
+                                .find_client_by_id(task.client_id)
+                                .on_resp(task, Some(Error::ReadTimeout));
+                        }),
+                    ));
+                }),
+            ));
+            return;
+        }
+
         self.events.borrow_mut().push(Event::new(
-            current_time + task_size,
-            EventType::TaskFinish,
+            now() + task_size,
+            EventType::HandleRead,
             Box::new(move |model: &mut Model| {
                 let this: &mut Server = model.find_server_by_id(this_server_id);
                 let task = this.workers[worker_id].take().unwrap();
-                if let Some((enqueue_time, task)) = this.task_queue.pop_front() {
-                    // invariant: there must be an idle worker, must schedule now
-                    this.schedule_wait_stat
-                        .record(now() - enqueue_time)
-                        .unwrap();
-                    this.on_req(task);
+                if let Some((accept_time, task)) = this.task_queue.pop_front() {
+                    this.schedule_wait_stat.record(now() - accept_time).unwrap();
+                    this.schedule_to_worker(worker_id, task, accept_time);
                 }
                 model.events.borrow_mut().push(Event::new(
                     now() + rpc_latency(false),
                     EventType::Response,
                     Box::new(move |model: &mut Model| {
-                        model.find_client_by_id(task.client_id).on_resp(task);
+                        model.find_client_by_id(task.client_id).on_resp(task, None);
                     }),
                 ));
             }),
@@ -254,9 +296,10 @@ struct Client {
     zone: Zone,
     id: u64,
     events: Events,
-    // task_id -> start_time
+    // req_id -> start_time
     pending_tasks: HashMap<u64, Time>,
     latency_stat: Histogram<Time>,
+    error_latency_stat: Histogram<Time>,
 }
 
 impl Client {
@@ -267,6 +310,8 @@ impl Client {
             events,
             pending_tasks: HashMap::new(),
             latency_stat: Histogram::<Time>::new_with_bounds(NANOSECOND, 60 * SECOND, 3).unwrap(),
+            error_latency_stat: Histogram::<Time>::new_with_bounds(NANOSECOND, 60 * SECOND, 3)
+                .unwrap(),
         }
     }
 
@@ -279,18 +324,33 @@ impl Client {
         let zone = self.zone;
         self.events.borrow_mut().push(Event::new(
             now + rpc_latency(false),
-            EventType::Request,
+            EventType::ReadRequest,
             Box::new(move |model: &mut Model| {
                 model.find_server_by_zone(zone).on_req(req);
             }),
         ));
     }
 
-    fn on_resp(&mut self, resp: Request) {
-        let start_time = self.pending_tasks.remove(&resp.req_id).unwrap();
+    fn on_resp(&mut self, req: Request, error: Option<Error>) {
+        let start_time = self.pending_tasks.remove(&req.req_id).unwrap();
         self.latency_stat
             .record((now() - start_time) / NANOSECOND)
             .unwrap();
+
+        if error.is_some() {
+            self.error_latency_stat
+                .record((now() - start_time) / NANOSECOND)
+                .unwrap();
+        }
+
+        // respond to app
+        self.events.borrow_mut().push(Event::new(
+            now() + rpc_latency(false),
+            EventType::AppResp,
+            Box::new(move |model: &mut Model| {
+                model.app.on_resp(req, error);
+            }),
+        ));
     }
 }
 
@@ -301,6 +361,38 @@ struct App {
     rng: StdRng,
     // the exponential distribution of the interval between two requests
     rate_exp_dist: Exp<f64>,
+    // start_ts => transaction.
+    pending_transactions: HashMap<Time, Transaction>,
+    txn_duration_stat: Histogram<Time>,
+}
+
+enum CommitPhase {
+    NotYet,
+    Prewriting,
+    Committing,
+    Committed,
+}
+
+struct Transaction {
+    zone: Zone,
+    start_ts: u64,
+    commit_ts: u64,
+    num_queries: u64,
+    finished_queries: u64,
+    commit_phase: CommitPhase,
+}
+
+impl Transaction {
+    fn new(num_queries: u64) -> Self {
+        Self {
+            zone: Zone::rand_zone(),
+            start_ts: now(),
+            commit_ts: 0,
+            num_queries,
+            finished_queries: 0,
+            commit_phase: CommitPhase::NotYet,
+        }
+    }
 }
 
 impl App {
@@ -309,29 +401,110 @@ impl App {
             events,
             rng: StdRng::from_seed(OsRng.gen()),
             rate_exp_dist: Exp::new(req_rate).unwrap(),
+            pending_transactions: HashMap::new(),
+            txn_duration_stat: Histogram::<Time>::new_with_bounds(NANOSECOND, 60 * SECOND, 3)
+                .unwrap(),
         }
     }
 
-    fn gen(&mut self) {
+    fn gen_txn(&mut self) {
+        let txn = Transaction::new(3);
+        let start_ts = txn.start_ts;
+        let zone = txn.zone;
+        self.pending_transactions.insert(txn.start_ts, txn);
+        Self::issue_new_read_request(self.events.clone(), start_ts, zone);
+
+        // Invariant: interval must be > 0, to avoid infinite loop.
+        // And to make start_ts unique as start_ts is using now() directly
+        let interval = ((self.rate_exp_dist.sample(&mut self.rng) * SECOND as f64) as Time).max(1);
+        self.events.borrow_mut().push(Event::new(
+            now() + interval,
+            EventType::AppGen,
+            Box::new(move |model: &mut Model| {
+                model.app.gen_txn();
+            }),
+        ));
+    }
+
+    fn on_resp(&mut self, req: Request, error: Option<Error>) {
+        if error.is_none() {
+            let txn = self.pending_transactions.get_mut(&req.start_ts).unwrap();
+            match txn.commit_phase {
+                CommitPhase::NotYet => {
+                    assert!(txn.finished_queries < txn.num_queries);
+                    txn.finished_queries += 1;
+                    if txn.finished_queries == txn.num_queries {
+                        txn.commit_phase = CommitPhase::Prewriting;
+                        // send prewrite request
+                        let zone = txn.zone;
+                        let prewrite_req = Request::new(
+                            txn.start_ts,
+                            EventType::PrewriteRequest,
+                            (rand::random::<u64>() % 5 + 1) * MILLISECOND,
+                            u64::MAX,
+                        );
+                        self.events.borrow_mut().push(Event::new(
+                            now() + rpc_latency(false),
+                            EventType::PrewriteRequest,
+                            Box::new(move |model: &mut Model| {
+                                model.find_client_by_zone(zone).on_req(prewrite_req);
+                            }),
+                        ));
+                    } else {
+                        // send next query
+                        Self::issue_new_read_request(self.events.clone(), txn.start_ts, txn.zone);
+                    }
+                }
+                CommitPhase::Prewriting => {
+                    txn.commit_phase = CommitPhase::Committing;
+                    // send commit request
+                    let zone = txn.zone;
+                    txn.commit_ts = now();
+                    let commit_req = Request::new(
+                        txn.start_ts,
+                        EventType::CommitRequest,
+                        (rand::random::<u64>() % 5 + 1) * MILLISECOND,
+                        u64::MAX,
+                    );
+                    self.events.borrow_mut().push(Event::new(
+                        now() + rpc_latency(false),
+                        EventType::CommitRequest,
+                        Box::new(move |model: &mut Model| {
+                            model.find_client_by_zone(zone).on_req(commit_req);
+                        }),
+                    ));
+                }
+                CommitPhase::Committing => {
+                    txn.commit_phase = CommitPhase::Committed;
+                    self.txn_duration_stat
+                        .record((now() - txn.start_ts) / NANOSECOND)
+                        .unwrap();
+                    self.pending_transactions.remove(&req.start_ts);
+                }
+                CommitPhase::Committed => {
+                    unreachable!();
+                }
+            }
+        } else {
+            self.pending_transactions.remove(&req.start_ts);
+            // simply abort the transaction.
+        }
+    }
+
+    fn issue_new_read_request(events: Events, start_ts: u64, zone: Zone) {
         // size of 1 - 5 ms
-        let req = Request::new((rand::random::<u64>() % 5 + 1) * MILLISECOND, u64::MAX);
-        let mut events = self.events.borrow_mut();
-        let zone = Zone::from_id(rand::random::<u64>() % 3);
-        events.push(Event::new(
+        let req = Request::new(
+            start_ts,
+            EventType::ReadRequest,
+            (rand::random::<u64>() % 5 + 1) * MILLISECOND,
+            u64::MAX,
+        );
+        let zone = zone;
+        events.borrow_mut().push(Event::new(
             now() + rpc_latency(false),
             EventType::AppReq,
             Box::new(move |model: &mut Model| {
                 model.find_client_by_zone(zone).on_req(req);
-            }),
-        ));
-
-        // interval must be > 0, to avoid infinite loop
-        let interval = ((self.rate_exp_dist.sample(&mut self.rng) * SECOND as f64) as Time).max(1);
-        events.push(Event::new(
-            now() + interval,
-            EventType::AppGen,
-            Box::new(move |model: &mut Model| {
-                model.app.gen();
             }),
         ));
     }
@@ -354,16 +527,22 @@ fn rpc_latency(remote: bool) -> u64 {
     t
 }
 
+// a request, its content are permanent and immutable, even if it's sent to multiple servers.
 #[derive(Clone)]
 struct Request {
+    start_ts: u64,
+    req_type: EventType,
     req_id: u64,
     client_id: u64,
-    size: Time, // the time needed to finish the task, in microsecond
+    // the time needed to finish the task, in microsecond
+    size: Time,
 }
 
 impl Request {
-    fn new(size: Time, client_id: u64) -> Self {
+    fn new(start_ts: u64, req_type: EventType, size: Time, client_id: u64) -> Self {
         Self {
+            start_ts,
+            req_type,
             req_id: TASK_COUNTER.fetch_add(1, atomic::Ordering::SeqCst),
             client_id,
             size,
@@ -437,11 +616,22 @@ impl Ord for Event {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 enum EventType {
-    TaskFinish,
-    Request,
+    HandleRead,
+    ReadRequest,
+    ReadRequestTimeout,
+    PrewriteRequest,
+    CommitRequest,
     Response,
     AppReq,
+    AppResp,
     AppGen,
 }
+
+enum Error {
+    // server is busy - deadline exceeded
+    ReadTimeout,
+}
+
+type Result<T> = std::result::Result<T, Error>;
