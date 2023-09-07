@@ -1,0 +1,9 @@
+[package]
+name = "tikv-sim"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hdrhistogram = "7.5.2"
+rand = "0.8.5"
+rand_distr = "0.4.3"
