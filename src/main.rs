@@ -1,3 +1,5 @@
+use hdrhistogram::Histogram;
+use lazy_static::lazy_static;
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
@@ -7,11 +9,29 @@ use std::sync::atomic::AtomicU64;
 
 use rand::rngs::{OsRng, StdRng};
 use rand::{Rng, SeedableRng};
-use rand_distr::{Distribution, Exp};
+use rand_distr::{Distribution, Exp, LogNormal};
 
 type Events = Rc<RefCell<EventHeap>>;
 
 type Time = u64;
+
+trait TimeTrait {
+    fn pretty_print(&self) -> String;
+}
+
+impl TimeTrait for Time {
+    fn pretty_print(&self) -> String {
+        if *self < MICROSECOND {
+            format!("{} ns", self)
+        } else if *self < MILLISECOND {
+            format!("{:.2} us", *self as f64 / MICROSECOND as f64)
+        } else if *self < SECOND {
+            format!("{:.2} ms", *self as f64 / MILLISECOND as f64)
+        } else {
+            format!("{:.2} s", *self as f64 / SECOND as f64)
+        }
+    }
+}
 
 const NANOSECOND: Time = 1;
 const MICROSECOND: Time = 1_000;
@@ -24,17 +44,39 @@ static SERVER_COUNTER: AtomicU64 = AtomicU64::new(0);
 static CLIENT_COUNTER: AtomicU64 = AtomicU64::new(0);
 static CURRENT_TIME: AtomicU64 = AtomicU64::new(0);
 
+// https://aws.amazon.com/blogs/architecture/improving-performance-and-reducing-cost-using-availability-zone-affinity/
+// https://www.xkyle.com/Measuring-AWS-Region-and-AZ-Latency/
+lazy_static! {
+    // 跨AZ
+    static ref REMOTE_NET_LATENCY_DIST: LogNormal<f64> = {
+        let mean = 0.5 * MILLISECOND as f64;
+        let std_dev = 0.1 * MILLISECOND as f64;
+        let location = (mean.powi(2) / (mean.powi(2) + std_dev.powi(2)).sqrt()).ln();
+        let scale = (1.0 + std_dev.powi(2) / mean.powi(2)).ln().sqrt();
+        LogNormal::new(location, scale).unwrap()
+    };
+
+    // AZ内
+    static ref LOCAL_NET_LATENCY_DIST: LogNormal<f64> = {
+        let mean = 0.05 * MILLISECOND as f64;
+        let std_dev = 0.01 * MILLISECOND as f64;
+        let location = (mean.powi(2) / (mean.powi(2) + std_dev.powi(2)).sqrt()).ln();
+        let scale = (1.0 + std_dev.powi(2) / mean.powi(2)).ln().sqrt();
+        LogNormal::new(location, scale).unwrap()
+    };
+}
+
 fn main() {
     let events: Rc<RefCell<EventHeap>> = Rc::new(RefCell::new(EventHeap::new()));
 
     let mut model = Model {
         events: events.clone(),
-        servers: [
+        servers: vec![
             Server::new(Role::Leader, Zone::AZ1, events.clone(), 4),
             Server::new(Role::Follower, Zone::AZ2, events.clone(), 4),
             Server::new(Role::Follower, Zone::AZ3, events.clone(), 4),
         ],
-        clients: [
+        clients: vec![
             Client::new(Zone::AZ1, events.clone()),
             Client::new(Zone::AZ2, events.clone()),
             Client::new(Zone::AZ3, events.clone()),
@@ -43,7 +85,7 @@ fn main() {
     };
 
     model.app.gen();
-    let max_time = 1 * SECOND;
+    let max_time = 60 * SECOND;
 
     loop {
         // get current event time
@@ -61,12 +103,41 @@ fn main() {
         drop(events_mut);
         (event.f)(&mut model);
     }
+
+    println!(
+        "simulation time: {}, generated {} tasks, finished {} tasks",
+        now().pretty_print(),
+        TASK_COUNTER.load(atomic::Ordering::SeqCst),
+        model
+            .clients
+            .iter()
+            .map(|c| c.latency_stat.len())
+            .sum::<u64>()
+    );
+
+    for client in model.clients {
+        println!(
+            "client {:?} mean: {}, p99: {}",
+            client.id,
+            (client.latency_stat.mean() as u64).pretty_print(),
+            (client.latency_stat.value_at_quantile(0.99) as u64).pretty_print()
+        );
+    }
+
+    for server in model.servers {
+        println!(
+            "server {:?} schedule wait mean: {}, p99: {}",
+            server.server_id,
+            (server.schedule_wait_stat.mean() as u64).pretty_print(),
+            (server.schedule_wait_stat.value_at_quantile(0.99) as u64).pretty_print(),
+        );
+    }
 }
 
 struct Model {
     events: Events,
-    servers: [Server; 3],
-    clients: [Client; 3],
+    servers: Vec<Server>,
+    clients: Vec<Client>,
     app: App,
 }
 
@@ -119,8 +190,10 @@ struct Server {
     zone: Zone,
     server_id: u64,
     events: Events,
-    task_queue: VecDeque<Request>,
+    // Vec<(time when enqueue, task)>
+    task_queue: VecDeque<(Time, Request)>,
     workers: Vec<Option<Request>>,
+    schedule_wait_stat: Histogram<Time>,
 }
 
 impl Server {
@@ -132,17 +205,19 @@ impl Server {
             events,
             task_queue: VecDeque::new(),
             workers: vec![None; num_workers],
+            schedule_wait_stat: Histogram::<Time>::new_with_bounds(NANOSECOND, 60 * SECOND, 3)
+                .unwrap(),
         }
     }
 
-    fn schedule_task(&mut self, task: Request) {
+    fn on_req(&mut self, task: Request) {
         if self.workers.iter().all(|w| w.is_some()) {
             // busy
-            self.task_queue.push_back(task);
+            self.task_queue.push_back((now(), task));
             return;
         }
-
-        // some worker is idle
+        self.schedule_wait_stat.record(0).unwrap();
+        // some work is idle, schedule now
         let worker_id = self.workers.iter().position(|w| w.is_none()).unwrap();
         let task_size = task.size;
         self.workers[worker_id] = Some(task);
@@ -156,11 +231,15 @@ impl Server {
             Box::new(move |model: &mut Model| {
                 let this: &mut Server = model.find_server_by_id(this_server_id);
                 let task = this.workers[worker_id].take().unwrap();
-                if let Some(task) = this.task_queue.pop_front() {
-                    this.schedule_task(task);
+                if let Some((enqueue_time, task)) = this.task_queue.pop_front() {
+                    // invariant: there must be an idle worker, must schedule now
+                    this.schedule_wait_stat
+                        .record(now() - enqueue_time)
+                        .unwrap();
+                    this.on_req(task);
                 }
                 model.events.borrow_mut().push(Event::new(
-                    now() + rpc_latency(),
+                    now() + rpc_latency(false),
                     EventType::Response,
                     Box::new(move |model: &mut Model| {
                         model.find_client_by_id(task.client_id).on_resp(task);
@@ -177,6 +256,7 @@ struct Client {
     events: Events,
     // task_id -> start_time
     pending_tasks: HashMap<u64, Time>,
+    latency_stat: Histogram<Time>,
 }
 
 impl Client {
@@ -186,6 +266,7 @@ impl Client {
             zone,
             events,
             pending_tasks: HashMap::new(),
+            latency_stat: Histogram::<Time>::new_with_bounds(NANOSECOND, 60 * SECOND, 3).unwrap(),
         }
     }
 
@@ -197,22 +278,19 @@ impl Client {
         self.pending_tasks.insert(req.req_id, now);
         let zone = self.zone;
         self.events.borrow_mut().push(Event::new(
-            now + rpc_latency(),
+            now + rpc_latency(false),
             EventType::Request,
             Box::new(move |model: &mut Model| {
-                model.find_server_by_zone(zone).schedule_task(req);
+                model.find_server_by_zone(zone).on_req(req);
             }),
         ));
     }
 
     fn on_resp(&mut self, resp: Request) {
-        let _start_time = self.pending_tasks.remove(&resp.req_id).unwrap();
-        println!(
-            "resp {} finished, takes {} ms, {} in flight",
-            resp.req_id,
-            (now() - _start_time) / (MILLISECOND),
-            self.pending_tasks.len()
-        );
+        let start_time = self.pending_tasks.remove(&resp.req_id).unwrap();
+        self.latency_stat
+            .record((now() - start_time) / NANOSECOND)
+            .unwrap();
     }
 }
 
@@ -220,7 +298,6 @@ struct App {
     events: Events,
     // the arrival rate of requests
     // in requests per second
-    req_rate: f64,
     rng: StdRng,
     // the exponential distribution of the interval between two requests
     rate_exp_dist: Exp<f64>,
@@ -230,7 +307,6 @@ impl App {
     fn new(events: Events, req_rate: f64) -> Self {
         Self {
             events,
-            req_rate,
             rng: StdRng::from_seed(OsRng.gen()),
             rate_exp_dist: Exp::new(req_rate).unwrap(),
         }
@@ -242,7 +318,7 @@ impl App {
         let mut events = self.events.borrow_mut();
         let zone = Zone::from_id(rand::random::<u64>() % 3);
         events.push(Event::new(
-            now() + rpc_latency(),
+            now() + rpc_latency(false),
             EventType::AppReq,
             Box::new(move |model: &mut Model| {
                 model.find_client_by_zone(zone).on_req(req);
@@ -265,9 +341,17 @@ fn now() -> Time {
     CURRENT_TIME.load(atomic::Ordering::SeqCst)
 }
 
-fn rpc_latency() -> Time {
-    // 0~200 us
-    rand::random::<u64>() % 200 * MICROSECOND
+fn rpc_latency(remote: bool) -> u64 {
+    let mut rng = rand::thread_rng();
+    let t = if remote {
+        REMOTE_NET_LATENCY_DIST.sample(&mut rng) as u64
+    } else {
+        LOCAL_NET_LATENCY_DIST.sample(&mut rng) as u64
+    };
+    if t > 60 * SECOND {
+        panic!("invalid rpc latency: {}", t);
+    }
+    t
 }
 
 #[derive(Clone)]
@@ -314,7 +398,6 @@ impl EventHeap {
 
 struct Event {
     id: u64,
-    created_time: Time,
     trigger_time: Time,
     event_type: EventType,
     f: Box<dyn FnOnce(&mut Model)>,
@@ -324,7 +407,6 @@ impl Event {
     fn new(trigger_time: Time, event_type: EventType, f: Box<dyn FnOnce(&mut Model)>) -> Self {
         Event {
             id: EVENT_COUNTER.fetch_add(1, atomic::Ordering::SeqCst),
-            created_time: now(),
             trigger_time,
             event_type,
             f,
