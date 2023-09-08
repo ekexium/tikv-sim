@@ -48,7 +48,6 @@ static CURRENT_TIME: AtomicU64 = AtomicU64::new(0);
 // https://aws.amazon.com/blogs/architecture/improving-performance-and-reducing-cost-using-availability-zone-affinity/
 // https://www.xkyle.com/Measuring-AWS-Region-and-AZ-Latency/
 lazy_static! {
-    // 跨AZ
     static ref REMOTE_NET_LATENCY_DIST: LogNormal<f64> = {
         let mean = 0.5 * MILLISECOND as f64;
         let std_dev = 0.1 * MILLISECOND as f64;
@@ -56,8 +55,6 @@ lazy_static! {
         let scale = (1.0 + std_dev.powi(2) / mean.powi(2)).ln().sqrt();
         LogNormal::new(location, scale).unwrap()
     };
-
-    // AZ内
     static ref LOCAL_NET_LATENCY_DIST: LogNormal<f64> = {
         let mean = 0.05 * MILLISECOND as f64;
         let std_dev = 0.01 * MILLISECOND as f64;
@@ -73,9 +70,9 @@ fn main() {
     let mut model = Model {
         events: events.clone(),
         servers: vec![
-            Server::new(Role::Leader, Zone::AZ1, events.clone(), 4, 1 * SECOND),
-            Server::new(Role::Follower, Zone::AZ2, events.clone(), 4, 1 * SECOND),
-            Server::new(Role::Follower, Zone::AZ3, events.clone(), 4, 1 * SECOND),
+            Server::new(Role::Leader, Zone::AZ1, events.clone(), 4, 2, 1 * SECOND),
+            Server::new(Role::Follower, Zone::AZ2, events.clone(), 4, 2, 1 * SECOND),
+            Server::new(Role::Follower, Zone::AZ3, events.clone(), 4, 2, 1 * SECOND),
         ],
         clients: vec![
             Client::new(Zone::AZ1, events.clone()),
@@ -139,14 +136,21 @@ fn main() {
     }
 
     for server in model.servers {
+        println!("server {}", server.server_id);
         println!(
-            "server {:?} handled {} requests, {} in queue, {} timeouts, schedule wait mean: {}, p99: {}",
-            server.server_id,
-            server.schedule_wait_stat.len(),
-            server.task_queue.len(),
+            "handled {} read requests, {} in queue, {} timeouts, schedule wait mean: {}, p99: {}",
+            server.read_schedule_wait_stat.len(),
+            server.read_task_queue.len(),
             server.error_count,
-            (server.schedule_wait_stat.mean() as u64).pretty_print(),
-            (server.schedule_wait_stat.value_at_quantile(0.99) as u64).pretty_print(),
+            (server.read_schedule_wait_stat.mean() as u64).pretty_print(),
+            (server.read_schedule_wait_stat.value_at_quantile(0.99) as u64).pretty_print(),
+        );
+        println!(
+            "handled {} write requests, {} in queue, schedule wait mean: {}, p99: {}",
+            server.write_schedule_wait_stat.len(),
+            server.write_task_queue.len(),
+            (server.write_schedule_wait_stat.mean() as u64).pretty_print(),
+            (server.write_schedule_wait_stat.value_at_quantile(0.99) as u64).pretty_print(),
         );
     }
 }
@@ -209,49 +213,89 @@ struct Server {
     server_id: u64,
     events: Events,
     // Vec<(accept time, task)>
-    task_queue: VecDeque<(Time, Request)>,
-    workers: Vec<Option<Request>>,
-    schedule_wait_stat: Histogram<Time>,
-    // a read request will abort at this time if it cannot finish in time
+    read_task_queue: VecDeque<(Time, Request)>,
+    read_workers: Vec<Option<Request>>,
+    read_schedule_wait_stat: Histogram<Time>,
     read_timeout: Time,
+    // a read request will abort at this time if it cannot finish in time
     error_count: u64,
+
+    write_task_queue: VecDeque<(Time, Request)>,
+    write_workers: Vec<Option<Request>>,
+    write_schedule_wait_stat: Histogram<Time>,
 }
 
 impl Server {
-    fn new(role: Role, zone: Zone, events: Events, num_workers: usize, read_timeout: Time) -> Self {
+    fn new(
+        role: Role,
+        zone: Zone,
+        events: Events,
+        num_read_workers: usize,
+        num_write_workers: usize,
+        read_timeout: Time,
+    ) -> Self {
         Self {
             server_id: SERVER_COUNTER.fetch_add(1, atomic::Ordering::SeqCst),
             role,
             zone,
             events,
-            task_queue: VecDeque::new(),
-            workers: vec![None; num_workers],
-            schedule_wait_stat: Histogram::<Time>::new_with_bounds(NANOSECOND, 60 * SECOND, 3)
+            read_task_queue: VecDeque::new(),
+            read_workers: vec![None; num_read_workers],
+            write_task_queue: VecDeque::new(),
+            write_workers: vec![None; num_write_workers],
+            read_schedule_wait_stat: Histogram::<Time>::new_with_bounds(NANOSECOND, 60 * SECOND, 3)
                 .unwrap(),
             read_timeout,
             error_count: 0,
+            write_schedule_wait_stat: Histogram::<Time>::new_with_bounds(
+                NANOSECOND,
+                60 * SECOND,
+                3,
+            )
+            .unwrap(),
         }
     }
 
     fn on_req(&mut self, task: Request) {
-        if self.workers.iter().all(|w| w.is_some()) {
-            // all busy
-            self.task_queue.push_back((now(), task));
-            return;
+        match task.req_type {
+            EventType::ReadRequest => {
+                if self.read_workers.iter().all(|w| w.is_some()) {
+                    // all busy
+                    self.read_task_queue.push_back((now(), task));
+                    return;
+                }
+                // some worker is idle, schedule now
+                self.read_schedule_wait_stat.record(0).unwrap();
+                let worker_id = self.read_workers.iter().position(|w| w.is_none()).unwrap();
+                self.schedule_to_read_worker(worker_id, task, now());
+            }
+            EventType::PrewriteRequest | EventType::CommitRequest => {
+                // FCFS, no timeout
+                assert!(self.role == Role::Leader);
+                if self.write_workers.iter().all(|w| w.is_some()) {
+                    // all busy
+                    self.write_task_queue.push_back((now(), task));
+                    return;
+                }
+                // some worker is idle, schedule now
+                self.write_schedule_wait_stat.record(0).unwrap();
+                let worker_id = self.write_workers.iter().position(|w| w.is_none()).unwrap();
+                self.schedule_to_write_worker(worker_id, task, now());
+            }
+            _ => unreachable!(),
         }
-        // some work is idle, schedule now
-        self.schedule_wait_stat.record(0).unwrap();
-        let worker_id = self.workers.iter().position(|w| w.is_none()).unwrap();
-        self.schedule_to_worker(worker_id, task, now());
     }
 
     // a worker is idle, schedule a task onto it now.
     // Invariant: the worker is idle.
-    fn schedule_to_worker(&mut self, worker_id: usize, req: Request, accept_time: Time) {
-        assert!(self.workers[worker_id].is_none());
+    fn schedule_to_read_worker(&mut self, worker_id: usize, req: Request, accept_time: Time) {
+        assert!(self.read_workers[worker_id].is_none());
+        self.read_schedule_wait_stat
+            .record(now() - accept_time)
+            .unwrap();
 
         let task_size = req.size;
-        self.workers[worker_id] = Some(req);
+        self.read_workers[worker_id] = Some(req);
         let this_server_id = self.server_id;
         if accept_time + self.read_timeout < now() + task_size {
             // will timeout. It tries for `read_timeout`, and then decide to abort.
@@ -261,10 +305,9 @@ impl Server {
                 Box::new(move |model: &mut Model| {
                     let this = model.find_server_by_id(this_server_id);
                     this.error_count += 1;
-                    let task = this.workers[worker_id].take().unwrap();
-                    if let Some((accept_time, task)) = this.task_queue.pop_front() {
-                        this.schedule_wait_stat.record(now() - accept_time).unwrap();
-                        this.schedule_to_worker(worker_id, task, accept_time);
+                    let task = this.read_workers[worker_id].take().unwrap();
+                    if let Some((accept_time, task)) = this.read_task_queue.pop_front() {
+                        this.schedule_to_read_worker(worker_id, task, accept_time);
                     }
                     model.events.borrow_mut().push(Event::new(
                         now() + rpc_latency(false),
@@ -285,10 +328,9 @@ impl Server {
             EventType::HandleRead,
             Box::new(move |model: &mut Model| {
                 let this: &mut Server = model.find_server_by_id(this_server_id);
-                let task = this.workers[worker_id].take().unwrap();
-                if let Some((accept_time, task)) = this.task_queue.pop_front() {
-                    this.schedule_wait_stat.record(now() - accept_time).unwrap();
-                    this.schedule_to_worker(worker_id, task, accept_time);
+                let task = this.read_workers[worker_id].take().unwrap();
+                if let Some((accept_time, task)) = this.read_task_queue.pop_front() {
+                    this.schedule_to_read_worker(worker_id, task, accept_time);
                 }
                 model.events.borrow_mut().push(Event::new(
                     now() + rpc_latency(false),
@@ -300,13 +342,55 @@ impl Server {
             }),
         ));
     }
+
+    fn schedule_to_write_worker(&mut self, worker_id: usize, req: Request, accept_time: Time) {
+        assert!(self.write_workers[worker_id].is_none());
+        self.write_schedule_wait_stat
+            .record(now() - accept_time)
+            .unwrap();
+        let req_size = req.size;
+        self.write_workers[worker_id] = Some(req);
+        let this_server_id = self.server_id;
+        self.events.borrow_mut().push(Event::new(
+            now() + req_size,
+            EventType::Response,
+            Box::new(move |model: &mut Model| {
+                let this: &mut Server = model.find_server_by_id(this_server_id);
+                let task = this.write_workers[worker_id].take().unwrap();
+                if let Some((accept_time, task)) = this.write_task_queue.pop_front() {
+                    this.schedule_to_write_worker(worker_id, task, accept_time);
+                }
+                let this_zone = this.zone;
+
+                let client = model.find_client_by_id(task.client_id);
+                let remote = this_zone != client.zone;
+                model.events.borrow_mut().push(Event::new(
+                    now() + rpc_latency(remote),
+                    EventType::Response,
+                    Box::new(move |model: &mut Model| {
+                        model.find_client_by_id(task.client_id).on_resp(task, None);
+                    }),
+                ));
+            }),
+        ));
+    }
+}
+
+enum PeerSelectorState {
+    Read(ReaderState),
+    Write(WriterState),
 }
 
 // local -> leader -> random follower -> error
-enum PeerSelectorState {
+enum ReaderState {
     Local,
     Leader,
     RandomFollower,
+}
+
+enum WriterState {
+    Leader,
+    LeaderFailed,
 }
 
 // TODO: this is a naive one, different from the one in client-go. Take care.
@@ -317,42 +401,59 @@ struct PeerSelector {
 }
 
 impl PeerSelector {
-    fn new(local: Zone) -> Self {
+    fn new(local: Zone, req: &Request) -> Self {
+        let state = match req.req_type {
+            EventType::ReadRequest => PeerSelectorState::Read(ReaderState::Local),
+            EventType::PrewriteRequest | EventType::CommitRequest => {
+                PeerSelectorState::Write(WriterState::Leader)
+            }
+            _ => unreachable!(),
+        };
         Self {
-            state: PeerSelectorState::Local,
+            state: state,
             follower_ids_tried: HashSet::new(),
             local_zone: local,
         }
     }
 
     fn next<'a>(&mut self, servers: &'a mut Vec<Server>) -> Option<&'a mut Server> {
-        match self.state {
-            PeerSelectorState::Local => {
-                self.state = PeerSelectorState::Leader;
-                let s = servers
-                    .iter_mut()
-                    .find(|s| s.zone == self.local_zone)
-                    .unwrap();
-                self.follower_ids_tried.insert(s.server_id);
-                Some(s)
-            }
-            PeerSelectorState::Leader => {
-                self.state = PeerSelectorState::RandomFollower;
-                let s = servers.iter_mut().find(|s| s.role == Role::Leader).unwrap();
-                Some(s)
-            }
-            PeerSelectorState::RandomFollower => {
-                let mut rng = rand::thread_rng();
-                let follower = servers
-                    .iter_mut()
-                    .filter(|s| s.role == Role::Follower)
-                    .filter(|s| !self.follower_ids_tried.contains(&s.server_id))
-                    .choose(&mut rng);
-                if let Some(ref follower) = follower {
-                    self.follower_ids_tried.insert(follower.server_id);
+        match &mut self.state {
+            PeerSelectorState::Read(state) => match state {
+                ReaderState::Local => {
+                    *state = ReaderState::Leader;
+                    let s = servers
+                        .iter_mut()
+                        .find(|s| s.zone == self.local_zone)
+                        .unwrap();
+                    self.follower_ids_tried.insert(s.server_id);
+                    Some(s)
                 }
-                follower
-            }
+                ReaderState::Leader => {
+                    *state = ReaderState::RandomFollower;
+                    let s = servers.iter_mut().find(|s| s.role == Role::Leader).unwrap();
+                    Some(s)
+                }
+                ReaderState::RandomFollower => {
+                    let mut rng = rand::thread_rng();
+                    let follower = servers
+                        .iter_mut()
+                        .filter(|s| s.role == Role::Follower)
+                        .filter(|s| !self.follower_ids_tried.contains(&s.server_id))
+                        .choose(&mut rng);
+                    if let Some(ref follower) = follower {
+                        self.follower_ids_tried.insert(follower.server_id);
+                    }
+                    follower
+                }
+            },
+            PeerSelectorState::Write(state) => match state {
+                WriterState::Leader => {
+                    let s = servers.iter_mut().find(|s| s.role == Role::Leader).unwrap();
+                    *state = WriterState::LeaderFailed;
+                    Some(s)
+                }
+                WriterState::LeaderFailed => None,
+            },
         }
     }
 }
@@ -384,7 +485,7 @@ impl Client {
     fn on_req(&mut self, mut req: Request) {
         req.client_id = self.id;
         let now = now();
-        let selector = Rc::new(RefCell::new(PeerSelector::new(self.zone)));
+        let selector = Rc::new(RefCell::new(PeerSelector::new(self.zone, &req)));
         self.pending_tasks
             .insert(req.req_id, (now, selector.clone()));
         self.issue_request(req, selector);
@@ -720,5 +821,3 @@ enum Error {
     // all servers are unavailable
     RegionUnavailable,
 }
-
-type Result<T> = std::result::Result<T, Error>;
