@@ -1,7 +1,7 @@
 use hdrhistogram::Histogram;
 use lazy_static::lazy_static;
 use std::cell::RefCell;
-use std::cmp::Ordering;
+use std::cmp::{min, Ordering};
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::atomic;
@@ -70,9 +70,36 @@ fn main() {
     let mut model = Model {
         events: events.clone(),
         servers: vec![
-            Server::new(Role::Leader, Zone::AZ1, events.clone(), 4, 2, 1 * SECOND),
-            Server::new(Role::Follower, Zone::AZ2, events.clone(), 4, 2, 1 * SECOND),
-            Server::new(Role::Follower, Zone::AZ3, events.clone(), 4, 2, 1 * SECOND),
+            Server::new(
+                Role::Leader,
+                Zone::AZ1,
+                events.clone(),
+                4,
+                20,
+                1 * SECOND,
+                5 * SECOND,
+                5 * SECOND,
+            ),
+            Server::new(
+                Role::Follower,
+                Zone::AZ2,
+                events.clone(),
+                4,
+                20,
+                1 * SECOND,
+                5 * SECOND,
+                5 * SECOND,
+            ),
+            Server::new(
+                Role::Follower,
+                Zone::AZ3,
+                events.clone(),
+                4,
+                20,
+                1 * SECOND,
+                5 * SECOND,
+                5 * SECOND,
+            ),
         ],
         clients: vec![
             Client::new(Zone::AZ1, events.clone()),
@@ -138,6 +165,11 @@ fn main() {
     for server in model.servers {
         println!("server {}", server.server_id);
         println!(
+            "resolved-ts {}, safe-ts {}",
+            server.resolved_ts.pretty_print(),
+            server.safe_ts.pretty_print()
+        );
+        println!(
             "handled {} read requests, {} in queue, {} timeouts, schedule wait mean: {}, p99: {}",
             server.read_schedule_wait_stat.len(),
             server.read_task_queue.len(),
@@ -160,6 +192,15 @@ struct Model {
     servers: Vec<Server>,
     clients: Vec<Client>,
     app: App,
+}
+
+impl Model {
+    fn find_followers_of_leader(&mut self, _leader_id: u64) -> Vec<&mut Server> {
+        self.servers
+            .iter_mut()
+            .filter(|s| s.role == Role::Follower)
+            .collect()
+    }
 }
 
 impl Model {
@@ -223,6 +264,14 @@ struct Server {
     write_task_queue: VecDeque<(Time, Request)>,
     write_workers: Vec<Option<Request>>,
     write_schedule_wait_stat: Histogram<Time>,
+    // start_ts
+    lock_cf: HashSet<u64>,
+    // for leader, we assume the apply process are all fast enough.
+    resolved_ts: u64,
+    // for all roles
+    safe_ts: u64,
+    advance_interval: Time,
+    broadcast_interval: Time,
 }
 
 impl Server {
@@ -233,8 +282,10 @@ impl Server {
         num_read_workers: usize,
         num_write_workers: usize,
         read_timeout: Time,
+        advance_interval: Time,
+        check_leader_interval: Time,
     ) -> Self {
-        Self {
+        let mut ret = Self {
             server_id: SERVER_COUNTER.fetch_add(1, atomic::Ordering::SeqCst),
             role,
             zone,
@@ -253,7 +304,67 @@ impl Server {
                 3,
             )
             .unwrap(),
+            lock_cf: HashSet::new(),
+            resolved_ts: 0,
+            safe_ts: 0,
+            advance_interval,
+            broadcast_interval: check_leader_interval,
+        };
+
+        if ret.role == Role::Leader {
+            ret.update_resolved_ts();
+            ret.broadcast_safe_ts();
         }
+        ret
+    }
+
+    fn update_resolved_ts(&mut self) {
+        assert!(self.role == Role::Leader);
+        let min_lock = *self.lock_cf.iter().min().unwrap_or(&u64::MAX);
+        let new_resolved_ts = min(now(), min_lock);
+        assert!(new_resolved_ts >= self.resolved_ts);
+        self.resolved_ts = new_resolved_ts;
+        self.safe_ts = self.resolved_ts;
+
+        let this_server_id = self.server_id;
+        self.events.borrow_mut().push(Event::new(
+            now() + self.advance_interval,
+            EventType::ResolvedTsUpdate,
+            Box::new(move |model: &mut Model| {
+                let this = model.find_server_by_id(this_server_id);
+                this.update_resolved_ts();
+            }),
+        ));
+    }
+
+    fn broadcast_safe_ts(&mut self) {
+        assert!(self.role == Role::Leader);
+
+        let this_server_id = self.server_id;
+        let new_safe_ts = self.safe_ts;
+
+        // broadcast
+        let mut events = self.events.borrow_mut();
+        events.push(Event::new(
+            now() + rpc_latency(true),
+            EventType::BroadcastSafeTs,
+            Box::new(move |model: &mut Model| {
+                for follower in model.find_followers_of_leader(this_server_id) {
+                    assert!(follower.safe_ts <= new_safe_ts);
+                    follower.safe_ts = new_safe_ts;
+                }
+            }),
+        ));
+
+        // schedule next
+        events.push(Event::new(
+            now() + self.broadcast_interval,
+            EventType::BroadcastSafeTs,
+            Box::new(move |model: &mut Model| {
+                let this = model.find_server_by_id(this_server_id);
+                this.broadcast_safe_ts();
+            }),
+        ));
     }
 
     fn on_req(&mut self, task: Request) {
@@ -265,7 +376,6 @@ impl Server {
                     return;
                 }
                 // some worker is idle, schedule now
-                self.read_schedule_wait_stat.record(0).unwrap();
                 let worker_id = self.read_workers.iter().position(|w| w.is_none()).unwrap();
                 self.schedule_to_read_worker(worker_id, task, now());
             }
@@ -278,7 +388,6 @@ impl Server {
                     return;
                 }
                 // some worker is idle, schedule now
-                self.write_schedule_wait_stat.record(0).unwrap();
                 let worker_id = self.write_workers.iter().position(|w| w.is_none()).unwrap();
                 self.schedule_to_write_worker(worker_id, task, now());
             }
@@ -349,14 +458,22 @@ impl Server {
             .record(now() - accept_time)
             .unwrap();
         let req_size = req.size;
+        if req.req_type == EventType::PrewriteRequest {
+            self.lock_cf.insert(req.start_ts);
+        }
         self.write_workers[worker_id] = Some(req);
         let this_server_id = self.server_id;
         self.events.borrow_mut().push(Event::new(
             now() + req_size,
-            EventType::Response,
+            EventType::HandleWrite,
             Box::new(move |model: &mut Model| {
                 let this: &mut Server = model.find_server_by_id(this_server_id);
                 let task = this.write_workers[worker_id].take().unwrap();
+
+                if task.req_type == EventType::CommitRequest {
+                    this.lock_cf.remove(&task.start_ts);
+                }
+
                 if let Some((accept_time, task)) = this.write_task_queue.pop_front() {
                     this.schedule_to_write_worker(worker_id, task, accept_time);
                 }
@@ -596,7 +713,7 @@ impl App {
     }
 
     fn gen_txn(&mut self) {
-        let txn = Transaction::new(3);
+        let txn = Transaction::new(6);
         let start_ts = txn.start_ts;
         let zone = txn.zone;
         self.pending_transactions.insert(txn.start_ts, txn);
@@ -800,9 +917,12 @@ impl Ord for Event {
     }
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 enum EventType {
     HandleRead,
+    HandleWrite,
+    ResolvedTsUpdate,
+    BroadcastSafeTs,
     ReadRequest,
     ReadRequestTimeout,
     PrewriteRequest,
