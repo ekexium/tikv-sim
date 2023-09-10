@@ -792,26 +792,60 @@ struct Transaction {
     // invariant: must be smaller than start_ts and now().
     stale_read_ts: Option<u64>,
     commit_ts: u64,
-    num_queries: u64,
-    finished_queries: u64,
+    remaining_queries: VecDeque<Request>,
     commit_phase: CommitPhase,
+    prewrite_req: Option<Request>,
+    commit_req: Option<Request>,
 }
 
 impl Transaction {
     fn new(num_queries: u64, read_only: bool, read_staleness: Option<Time>) -> Self {
         assert!(read_staleness.is_none() || read_only);
+        // we assume at least 1 query.
+        assert!(num_queries > 0);
+        let mut remaining_queries = VecDeque::new();
+        let start_ts = now();
+        let stale_read_ts = read_staleness.map(|staleness| now().saturating_sub(staleness));
+        for _ in 0..num_queries {
+            remaining_queries.push_back(Request::new(
+                start_ts,
+                stale_read_ts,
+                EventType::ReadRequest,
+                (rand::random::<u64>() % 5 + 1) * MILLISECOND,
+                u64::MAX,
+            ));
+        }
+        let (mut prewrite_req, mut commit_req) = (None, None);
+        if !read_only {
+            prewrite_req = Some(Request::new(
+                start_ts,
+                None,
+                EventType::PrewriteRequest,
+                (rand::random::<u64>() % 5 + 1) * MILLISECOND,
+                u64::MAX,
+            ));
+            commit_req = Some(Request::new(
+                start_ts,
+                None,
+                EventType::CommitRequest,
+                (rand::random::<u64>() % 5 + 1) * MILLISECOND,
+                u64::MAX,
+            ));
+        }
+
         Self {
             zone: Zone::rand_zone(),
-            start_ts: now(),
+            start_ts,
             commit_ts: 0,
-            num_queries,
-            finished_queries: 0,
+            remaining_queries,
             commit_phase: if read_only {
                 CommitPhase::ReadOnly
             } else {
                 CommitPhase::NotYet
             },
-            stale_read_ts: read_staleness.map(|staleness| now().saturating_sub(staleness)),
+            stale_read_ts,
+            prewrite_req,
+            commit_req,
         }
     }
 }
@@ -833,16 +867,15 @@ impl App {
     fn gen_txn(&mut self) {
         // 5% read-write, 95% read-only transactions.
         let read_only = rand::random::<u64>() % 20 > 0;
-        let txn = Transaction::new(
+        let mut txn = Transaction::new(
             6,
             read_only,
             if read_only { self.read_staleness } else { None },
         );
-        let start_ts = txn.start_ts;
         let zone = txn.zone;
-        let stale_read_ts = txn.stale_read_ts;
+        let req = txn.remaining_queries.pop_front().unwrap();
         self.pending_transactions.insert(txn.start_ts, txn);
-        self.issue_new_read_request(start_ts, stale_read_ts, zone);
+        self.issue_request(zone, req);
 
         // Invariant: interval must be > 0, to avoid infinite loop.
         // And to make start_ts unique as start_ts is using now() directly
@@ -862,42 +895,30 @@ impl App {
             match txn.commit_phase {
                 CommitPhase::ReadOnly => {
                     // no need to prewrite and commit. finish all read queries
-                    txn.finished_queries += 1;
-                    if txn.finished_queries == txn.num_queries {
+                    txn.remaining_queries.pop_front();
+                    if let Some(req) = txn.remaining_queries.pop_front() {
+                        // send next query
+                        let zone = txn.zone;
+                        self.issue_request(zone, req);
+                    } else {
                         txn.commit_phase = CommitPhase::Committed;
                         self.txn_duration_stat
                             .record((now() - txn.start_ts) / NANOSECOND)
                             .unwrap();
                         self.pending_transactions.remove(&req.start_ts);
-                    } else {
-                        // send next query
-                        let start_ts = txn.start_ts;
-                        let zone = txn.zone;
-                        let stale_read_ts = txn.stale_read_ts;
-                        self.issue_new_read_request(start_ts, stale_read_ts, zone);
                     }
                 }
                 CommitPhase::NotYet => {
-                    assert!(txn.finished_queries < txn.num_queries);
-                    txn.finished_queries += 1;
-                    if txn.finished_queries == txn.num_queries {
+                    if let Some(req) = txn.remaining_queries.pop_front() {
+                        // send next query
+                        let zone = txn.zone;
+                        self.issue_request(zone, req);
+                    } else {
                         txn.commit_phase = CommitPhase::Prewriting;
                         // send prewrite request
                         let zone = txn.zone;
-                        let prewrite_req = Request::new(
-                            txn.start_ts,
-                            None,
-                            EventType::PrewriteRequest,
-                            (rand::random::<u64>() % 5 + 1) * MILLISECOND,
-                            u64::MAX,
-                        );
+                        let prewrite_req = txn.prewrite_req.take().unwrap();
                         self.issue_request(zone, prewrite_req);
-                    } else {
-                        // send next query
-                        let start_ts = txn.start_ts;
-                        let zone = txn.zone;
-                        let stale_read_ts = txn.stale_read_ts;
-                        self.issue_new_read_request(start_ts, stale_read_ts, zone);
                     }
                 }
                 CommitPhase::Prewriting => {
@@ -905,13 +926,7 @@ impl App {
                     // send commit request
                     let zone = txn.zone;
                     txn.commit_ts = now();
-                    let commit_req = Request::new(
-                        txn.start_ts,
-                        None,
-                        EventType::CommitRequest,
-                        (rand::random::<u64>() % 5 + 1) * MILLISECOND,
-                        u64::MAX,
-                    );
+                    let commit_req = txn.commit_req.take().unwrap();
                     self.issue_request(zone, commit_req);
                 }
                 CommitPhase::Committing => {
@@ -940,19 +955,6 @@ impl App {
                 model.find_client_by_zone(zone).on_req(req);
             }),
         ));
-    }
-
-    fn issue_new_read_request(&mut self, start_ts: u64, stale_read_ts: Option<u64>, zone: Zone) {
-        // size of 1 - 5 ms
-        let req = Request::new(
-            start_ts,
-            stale_read_ts,
-            EventType::ReadRequest,
-            (rand::random::<u64>() % 5 + 1) * MILLISECOND,
-            u64::MAX,
-        );
-        let zone = zone;
-        self.issue_request(zone, req);
     }
 }
 
