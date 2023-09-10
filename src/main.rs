@@ -68,48 +68,21 @@ fn main() {
     let events: Rc<RefCell<EventHeap>> = Rc::new(RefCell::new(EventHeap::new()));
 
     let mut model = Model {
+        replica_num: 3,
         events: events.clone(),
         servers: vec![
-            Server::new(
-                Role::Leader,
-                Zone::AZ1,
-                events.clone(),
-                4,
-                20,
-                1 * SECOND,
-                5 * SECOND,
-                5 * SECOND,
-            ),
-            Server::new(
-                Role::Follower,
-                Zone::AZ2,
-                events.clone(),
-                4,
-                20,
-                1 * SECOND,
-                5 * SECOND,
-                5 * SECOND,
-            ),
-            Server::new(
-                Role::Follower,
-                Zone::AZ3,
-                events.clone(),
-                4,
-                20,
-                1 * SECOND,
-                5 * SECOND,
-                5 * SECOND,
-            ),
+            Server::new(Zone::AZ1, events.clone(), 4, 20, 1 * SECOND),
+            Server::new(Zone::AZ2, events.clone(), 4, 20, 1 * SECOND),
+            Server::new(Zone::AZ3, events.clone(), 4, 20, 1 * SECOND),
         ],
         clients: vec![
             Client::new(Zone::AZ1, events.clone()),
             Client::new(Zone::AZ2, events.clone()),
             Client::new(Zone::AZ3, events.clone()),
         ],
-        app: App::new(events.clone(), 1000.0, Some(10 * SECOND)),
+        app: App::new(events.clone(), 5000.0, Some(15 * SECOND), 100),
     };
-
-    model.app.gen_txn();
+    model.init();
     let max_time = 60 * SECOND;
 
     loop {
@@ -139,7 +112,7 @@ fn main() {
             .map(|c| c.latency_stat.len())
             .sum::<u64>()
     );
-
+    println!("{} application retries", model.app.retry_count);
     println!(
         "finished {} transactions, {} still in flight",
         model.app.txn_duration_stat.len(),
@@ -173,11 +146,6 @@ fn main() {
     for server in model.servers {
         println!("\nserver {}", server.server_id);
         println!(
-            "resolved-ts {}, safe-ts {}",
-            server.resolved_ts.pretty_print(),
-            server.safe_ts.pretty_print()
-        );
-        println!(
             "handled {} read requests, {} in queue, {} timeouts, schedule wait mean: {}, p99: {}",
             server.read_schedule_wait_stat.len(),
             server.read_task_queue.len(),
@@ -199,21 +167,82 @@ struct Model {
     events: Events,
     servers: Vec<Server>,
     clients: Vec<Client>,
+    replica_num: usize,
     app: App,
 }
 
 impl Model {
-    fn find_followers_of_leader(&mut self, _leader_id: u64) -> Vec<&mut Server> {
-        self.servers
+    fn init(&mut self) {
+        // create regions
+        assert!(self.servers.len() >= self.replica_num);
+        let mut leader_idx = 0;
+        for region_id in 0..self.app.region_num {
+            // leader in server[leader_idx], `replica_num-1` followers in server[leader_idx + 1]..server[leader_idx+replica_num-1]
+            let mut leader = Peer {
+                role: Role::Leader,
+                server_id: self.servers[leader_idx].server_id,
+                region_id,
+                resolved_ts: 0,
+                safe_ts: 0,
+                lock_cf: HashSet::new(),
+                advance_interval: 5 * SECOND,
+                broadcast_interval: 5 * SECOND,
+            };
+            leader.update_resolved_ts(self.events.clone());
+            leader.broadcast_safe_ts(self.events.clone());
+            self.servers[leader_idx].peers.insert(region_id, leader);
+            for follow_id in 1..=self.replica_num - 1 {
+                let follower_idx = (leader_idx + follow_id) % self.servers.len();
+                let server_id = self.servers[follower_idx].server_id;
+                self.servers[follower_idx].peers.insert(
+                    region_id,
+                    Peer {
+                        role: Role::Follower,
+                        server_id,
+                        region_id,
+                        resolved_ts: 0,
+                        safe_ts: 0,
+                        lock_cf: HashSet::new(),
+                        advance_interval: 5 * SECOND,
+                        broadcast_interval: 5 * SECOND,
+                    },
+                );
+            }
+            leader_idx = (leader_idx + 1) % self.servers.len();
+        }
+
+        // start
+        self.app.gen_txn();
+    }
+
+    fn find_leader_by_id(servers: &mut Vec<Server>, region_id: u64) -> &mut Peer {
+        servers
             .iter_mut()
-            .filter(|s| s.role == Role::Follower)
+            .find(|s| {
+                s.peers
+                    .get(&region_id)
+                    .map(|p| p.role == Role::Leader)
+                    .unwrap_or(false)
+            })
+            .unwrap()
+            .peers
+            .get_mut(&region_id)
+            .unwrap()
+    }
+
+    fn find_followers_by_id(servers: &mut Vec<Server>, region_id: u64) -> Vec<&mut Peer> {
+        servers
+            .iter_mut()
+            .filter_map(|s| {
+                s.peers
+                    .get_mut(&region_id)
+                    .filter(|p| p.role == Role::Follower)
+            })
             .collect()
     }
-}
 
-impl Model {
-    fn find_server_by_id(&mut self, server_id: u64) -> &mut Server {
-        self.servers
+    fn find_server_by_id(servers: &mut Vec<Server>, server_id: u64) -> &mut Server {
+        servers
             .iter_mut()
             .find(|s| s.server_id == server_id)
             .unwrap()
@@ -221,10 +250,6 @@ impl Model {
 
     fn find_client_by_id(&mut self, client_id: u64) -> &mut Client {
         self.clients.iter_mut().find(|c| c.id == client_id).unwrap()
-    }
-
-    fn find_server_by_zone(&mut self, zone: Zone) -> &mut Server {
-        self.servers.iter_mut().find(|s| s.zone == zone).unwrap()
     }
 
     fn find_client_by_zone(&mut self, zone: Zone) -> &mut Client {
@@ -250,14 +275,80 @@ impl Zone {
     }
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Eq, Hash)]
 enum Role {
     Leader,
     Follower,
 }
 
-struct Server {
+#[derive(PartialEq, Eq)]
+struct Peer {
     role: Role,
+    server_id: u64,
+    region_id: u64,
+    // start_ts
+    lock_cf: HashSet<u64>,
+    // for leader, we assume the apply process are all fast enough.
+    resolved_ts: u64,
+    // for all roles
+    safe_ts: u64,
+    advance_interval: Time,
+    broadcast_interval: Time,
+}
+
+impl Peer {
+    fn update_resolved_ts(&mut self, events: Events) {
+        assert!(self.role == Role::Leader);
+        let min_lock = *self.lock_cf.iter().min().unwrap_or(&u64::MAX);
+        let new_resolved_ts = min(now(), min_lock);
+        assert!(new_resolved_ts >= self.resolved_ts);
+        self.resolved_ts = new_resolved_ts;
+        self.safe_ts = self.resolved_ts;
+
+        let this_region_id = self.region_id;
+        events.borrow_mut().push(Event::new(
+            now() + self.advance_interval,
+            EventType::ResolvedTsUpdate,
+            Box::new(move |model: &mut Model| {
+                let this = Model::find_leader_by_id(&mut model.servers, this_region_id);
+                this.update_resolved_ts(model.events.clone());
+            }),
+        ));
+    }
+
+    fn broadcast_safe_ts(&mut self, events: Events) {
+        assert!(self.role == Role::Leader);
+
+        let this_region_id = self.region_id;
+        let new_safe_ts = self.safe_ts;
+
+        // broadcast
+        let mut events = events.borrow_mut();
+        events.push(Event::new(
+            now() + rpc_latency(true),
+            EventType::BroadcastSafeTs,
+            Box::new(move |model: &mut Model| {
+                for follower in Model::find_followers_by_id(&mut model.servers, this_region_id) {
+                    assert!(follower.safe_ts <= new_safe_ts);
+                    follower.safe_ts = new_safe_ts;
+                }
+            }),
+        ));
+
+        // schedule next
+        events.push(Event::new(
+            now() + self.broadcast_interval,
+            EventType::BroadcastSafeTs,
+            Box::new(move |model: &mut Model| {
+                let this = Model::find_leader_by_id(&mut model.servers, this_region_id);
+                this.broadcast_safe_ts(model.events.clone());
+            }),
+        ));
+    }
+}
+
+struct Server {
+    peers: HashMap<u64, Peer>,
     zone: Zone,
     server_id: u64,
     events: Events,
@@ -272,30 +363,19 @@ struct Server {
     write_task_queue: VecDeque<(Time, Request)>,
     write_workers: Vec<Option<Request>>,
     write_schedule_wait_stat: Histogram<Time>,
-    // start_ts
-    lock_cf: HashSet<u64>,
-    // for leader, we assume the apply process are all fast enough.
-    resolved_ts: u64,
-    // for all roles
-    safe_ts: u64,
-    advance_interval: Time,
-    broadcast_interval: Time,
 }
 
 impl Server {
     fn new(
-        role: Role,
         zone: Zone,
         events: Events,
         num_read_workers: usize,
         num_write_workers: usize,
         read_timeout: Time,
-        advance_interval: Time,
-        check_leader_interval: Time,
     ) -> Self {
-        let mut ret = Self {
+        let ret = Self {
             server_id: SERVER_COUNTER.fetch_add(1, atomic::Ordering::SeqCst),
-            role,
+            peers: HashMap::new(),
             zone,
             events,
             read_task_queue: VecDeque::new(),
@@ -312,67 +392,8 @@ impl Server {
                 3,
             )
             .unwrap(),
-            lock_cf: HashSet::new(),
-            resolved_ts: 0,
-            safe_ts: 0,
-            advance_interval,
-            broadcast_interval: check_leader_interval,
         };
-
-        if ret.role == Role::Leader {
-            ret.update_resolved_ts();
-            ret.broadcast_safe_ts();
-        }
         ret
-    }
-
-    fn update_resolved_ts(&mut self) {
-        assert!(self.role == Role::Leader);
-        let min_lock = *self.lock_cf.iter().min().unwrap_or(&u64::MAX);
-        let new_resolved_ts = min(now(), min_lock);
-        assert!(new_resolved_ts >= self.resolved_ts);
-        self.resolved_ts = new_resolved_ts;
-        self.safe_ts = self.resolved_ts;
-
-        let this_server_id = self.server_id;
-        self.events.borrow_mut().push(Event::new(
-            now() + self.advance_interval,
-            EventType::ResolvedTsUpdate,
-            Box::new(move |model: &mut Model| {
-                let this = model.find_server_by_id(this_server_id);
-                this.update_resolved_ts();
-            }),
-        ));
-    }
-
-    fn broadcast_safe_ts(&mut self) {
-        assert!(self.role == Role::Leader);
-
-        let this_server_id = self.server_id;
-        let new_safe_ts = self.safe_ts;
-
-        // broadcast
-        let mut events = self.events.borrow_mut();
-        events.push(Event::new(
-            now() + rpc_latency(true),
-            EventType::BroadcastSafeTs,
-            Box::new(move |model: &mut Model| {
-                for follower in model.find_followers_of_leader(this_server_id) {
-                    assert!(follower.safe_ts <= new_safe_ts);
-                    follower.safe_ts = new_safe_ts;
-                }
-            }),
-        ));
-
-        // schedule next
-        events.push(Event::new(
-            now() + self.broadcast_interval,
-            EventType::BroadcastSafeTs,
-            Box::new(move |model: &mut Model| {
-                let this = model.find_server_by_id(this_server_id);
-                this.broadcast_safe_ts();
-            }),
-        ));
     }
 
     fn on_req(&mut self, task: Request) {
@@ -389,7 +410,6 @@ impl Server {
             }
             EventType::PrewriteRequest | EventType::CommitRequest => {
                 // FCFS, no timeout
-                assert!(self.role == Role::Leader);
                 if self.write_workers.iter().all(|w| w.is_some()) {
                     // all busy
                     self.write_task_queue.push_back((now(), task));
@@ -411,6 +431,8 @@ impl Server {
             .record(now() - accept_time)
             .unwrap();
 
+        let peer = self.peers.get_mut(&req.region_id).unwrap();
+
         let task_size = req.size;
         let stale_read_ts = req.stale_read_ts;
         self.read_workers[worker_id] = Some(req);
@@ -418,7 +440,7 @@ impl Server {
 
         // safe ts check
         if let Some(stale_read_ts) = stale_read_ts {
-            if stale_read_ts > self.safe_ts {
+            if stale_read_ts > peer.safe_ts {
                 // schedule next task in queue
                 let task = self.read_workers[worker_id].take().unwrap();
                 if let Some((accept_time, task)) = self.read_task_queue.pop_front() {
@@ -446,7 +468,7 @@ impl Server {
                 accept_time + self.read_timeout,
                 EventType::ReadRequestTimeout,
                 Box::new(move |model: &mut Model| {
-                    let this = model.find_server_by_id(this_server_id);
+                    let this = Model::find_server_by_id(&mut model.servers, this_server_id);
                     this.error_count += 1;
 
                     // schedule next task in queue
@@ -476,7 +498,8 @@ impl Server {
             EventType::HandleRead,
             Box::new(move |model: &mut Model| {
                 // schedule next task in queue
-                let this: &mut Server = model.find_server_by_id(this_server_id);
+                let this: &mut Server =
+                    Model::find_server_by_id(&mut model.servers, this_server_id);
                 let task = this.read_workers[worker_id].take().unwrap();
                 if let Some((accept_time, task)) = this.read_task_queue.pop_front() {
                     this.handle_read(worker_id, task, accept_time);
@@ -496,12 +519,14 @@ impl Server {
 
     fn handle_write(&mut self, worker_id: usize, req: Request, accept_time: Time) {
         assert!(self.write_workers[worker_id].is_none());
+        let peer = self.peers.get_mut(&req.region_id).unwrap();
+        assert!(peer.role == Role::Leader);
         self.write_schedule_wait_stat
             .record(now() - accept_time)
             .unwrap();
         let req_size = req.size;
         if req.req_type == EventType::PrewriteRequest {
-            self.lock_cf.insert(req.start_ts);
+            peer.lock_cf.insert(req.start_ts);
         }
         self.write_workers[worker_id] = Some(req);
         let this_server_id = self.server_id;
@@ -509,11 +534,14 @@ impl Server {
             now() + req_size,
             EventType::HandleWrite,
             Box::new(move |model: &mut Model| {
-                let this: &mut Server = model.find_server_by_id(this_server_id);
+                let this: &mut Server =
+                    Model::find_server_by_id(&mut model.servers, this_server_id);
                 let task = this.write_workers[worker_id].take().unwrap();
+                let peer = this.peers.get_mut(&task.region_id).unwrap();
+                assert!(peer.role == Role::Leader);
 
                 if task.req_type == EventType::CommitRequest {
-                    this.lock_cf.remove(&task.start_ts);
+                    assert!(peer.lock_cf.remove(&task.start_ts));
                 }
 
                 if let Some((accept_time, task)) = this.write_task_queue.pop_front() {
@@ -610,7 +638,9 @@ impl PeerSelector {
                     assert_eq!(req.req_type, EventType::ReadRequest);
                     req.stale_read_ts = None;
                     *state = StaleReaderState::RandomFollowerNormal;
-                    let s = servers.iter_mut().find(|s| s.role == Role::Leader).unwrap();
+                    let leader = Model::find_leader_by_id(servers, req.region_id);
+                    let server_id = leader.server_id;
+                    let s = Model::find_server_by_id(servers, server_id);
                     self.server_ids_tried_for_normal_read.insert(s.server_id);
                     Some(s)
                 }
@@ -618,21 +648,23 @@ impl PeerSelector {
                     assert_eq!(req.req_type, EventType::ReadRequest);
                     assert!(req.stale_read_ts.is_none());
                     let mut rng = rand::thread_rng();
-                    let follower = servers
-                        .iter_mut()
-                        .filter(|s| s.role == Role::Follower)
+                    let follower = Model::find_followers_by_id(servers, req.region_id)
+                        .into_iter()
                         .filter(|s| !self.server_ids_tried_for_normal_read.contains(&s.server_id))
                         .choose(&mut rng);
                     if let Some(ref follower) = follower {
                         self.server_ids_tried_for_normal_read
                             .insert(follower.server_id);
                     }
-                    follower
+                    let server_id = follower.map(|f| f.server_id);
+                    server_id.map(|id| Model::find_server_by_id(servers, id))
                 }
             },
             PeerSelectorState::Write(state) => match state {
                 WriterState::Leader => {
-                    let s = servers.iter_mut().find(|s| s.role == Role::Leader).unwrap();
+                    let leader = Model::find_leader_by_id(servers, req.region_id);
+                    let server_id = leader.server_id;
+                    let s = Model::find_server_by_id(servers, server_id);
                     *state = WriterState::LeaderFailed;
                     Some(s)
                 }
@@ -645,29 +677,32 @@ impl PeerSelector {
                     if let Some(s) = &s {
                         self.server_ids_tried_for_normal_read.insert(s.server_id);
                     }
+                    self.state = PeerSelectorState::NormalRead(NormalReaderState::LeaderNormal);
                     s
                 }
                 NormalReaderState::LeaderNormal => {
                     assert_eq!(req.req_type, EventType::ReadRequest);
-                    let s = servers.iter_mut().find(|s| s.role == Role::Leader);
-                    if let Some(s) = &s {
-                        self.server_ids_tried_for_normal_read.insert(s.server_id);
-                    }
-                    s
+                    let leader = Model::find_leader_by_id(servers, req.region_id);
+                    let server_id = leader.server_id;
+                    let s = Model::find_server_by_id(servers, server_id);
+                    self.server_ids_tried_for_normal_read.insert(s.server_id);
+                    self.state =
+                        PeerSelectorState::NormalRead(NormalReaderState::RandomFollowerNormal);
+                    Some(s)
                 }
                 NormalReaderState::RandomFollowerNormal => {
                     assert_eq!(req.req_type, EventType::ReadRequest);
                     let mut rng = rand::thread_rng();
-                    let follower = servers
-                        .iter_mut()
-                        .filter(|s| s.role == Role::Follower)
+                    let follower = Model::find_followers_by_id(servers, req.region_id)
+                        .into_iter()
                         .filter(|s| !self.server_ids_tried_for_normal_read.contains(&s.server_id))
                         .choose(&mut rng);
                     if let Some(ref follower) = follower {
                         self.server_ids_tried_for_normal_read
                             .insert(follower.server_id);
                     }
-                    follower
+                    let server_id = follower.map(|f| f.server_id);
+                    server_id.map(|server_id| Model::find_server_by_id(servers, server_id))
                 }
             },
         }
@@ -772,6 +807,8 @@ struct App {
     pending_transactions: HashMap<Time, Transaction>,
     txn_duration_stat: Histogram<Time>,
     read_staleness: Option<Time>,
+    region_num: u64,
+    retry_count: u64,
 }
 
 enum CommitPhase {
@@ -790,6 +827,7 @@ struct Transaction {
     start_ts: u64,
     // for read-only stale read transactions
     // invariant: must be smaller than start_ts and now().
+    #[allow(unused)]
     stale_read_ts: Option<u64>,
     commit_ts: u64,
     remaining_queries: VecDeque<Request>,
@@ -799,7 +837,12 @@ struct Transaction {
 }
 
 impl Transaction {
-    fn new(num_queries: u64, read_only: bool, read_staleness: Option<Time>) -> Self {
+    fn new(
+        num_queries: u64,
+        read_only: bool,
+        read_staleness: Option<Time>,
+        region_num: u64,
+    ) -> Self {
         assert!(read_staleness.is_none() || read_only);
         // we assume at least 1 query.
         assert!(num_queries > 0);
@@ -813,16 +856,19 @@ impl Transaction {
                 EventType::ReadRequest,
                 (rand::random::<u64>() % 5 + 1) * MILLISECOND,
                 u64::MAX,
+                rand::random::<u64>() % region_num,
             ));
         }
         let (mut prewrite_req, mut commit_req) = (None, None);
         if !read_only {
+            let write_region = rand::random::<u64>() % region_num;
             prewrite_req = Some(Request::new(
                 start_ts,
                 None,
                 EventType::PrewriteRequest,
                 (rand::random::<u64>() % 5 + 1) * MILLISECOND,
                 u64::MAX,
+                write_region,
             ));
             commit_req = Some(Request::new(
                 start_ts,
@@ -830,6 +876,7 @@ impl Transaction {
                 EventType::CommitRequest,
                 (rand::random::<u64>() % 5 + 1) * MILLISECOND,
                 u64::MAX,
+                write_region,
             ));
         }
 
@@ -852,7 +899,7 @@ impl Transaction {
 
 impl App {
     // req_rate: transactions per second
-    fn new(events: Events, txn_rate: f64, read_staleness: Option<Time>) -> Self {
+    fn new(events: Events, txn_rate: f64, read_staleness: Option<Time>, region_num: u64) -> Self {
         Self {
             events,
             rng: StdRng::from_seed(OsRng.gen()),
@@ -861,6 +908,8 @@ impl App {
             txn_duration_stat: Histogram::<Time>::new_with_bounds(NANOSECOND, 60 * SECOND, 3)
                 .unwrap(),
             read_staleness,
+            region_num,
+            retry_count: 0,
         }
     }
 
@@ -871,6 +920,7 @@ impl App {
             6,
             read_only,
             if read_only { self.read_staleness } else { None },
+            self.region_num,
         );
         let zone = txn.zone;
         let req = txn.remaining_queries.pop_front().unwrap();
@@ -943,6 +993,7 @@ impl App {
         } else {
             // application retry immediately
             let txn = self.pending_transactions.get(&req.start_ts).unwrap();
+            self.retry_count += 1;
             self.issue_request(txn.zone, req);
         }
     }
@@ -985,6 +1036,7 @@ struct Request {
     client_id: u64,
     // the time needed to finish the task, in microsecond
     size: Time,
+    region_id: u64,
 }
 
 impl Request {
@@ -994,6 +1046,7 @@ impl Request {
         req_type: EventType,
         size: Time,
         client_id: u64,
+        region: u64,
     ) -> Self {
         Self {
             start_ts,
@@ -1002,6 +1055,7 @@ impl Request {
             req_id: TASK_COUNTER.fetch_add(1, atomic::Ordering::SeqCst),
             client_id,
             size,
+            region_id: region,
         }
     }
 }
@@ -1032,6 +1086,7 @@ impl EventHeap {
     }
 }
 
+#[allow(unused)]
 struct Event {
     id: u64,
     trigger_time: Time,
