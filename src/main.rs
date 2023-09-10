@@ -106,7 +106,7 @@ fn main() {
             Client::new(Zone::AZ2, events.clone()),
             Client::new(Zone::AZ3, events.clone()),
         ],
-        app: App::new(events.clone(), 1000.0),
+        app: App::new(events.clone(), 1000.0, Some(10 * SECOND)),
     };
 
     model.app.gen_txn();
@@ -154,16 +154,24 @@ fn main() {
 
     for client in model.clients {
         println!(
-            "client {:?} mean: {}, p99: {}, {} errors",
+            "\nclient {:?} mean: {}, p99: {}",
             client.id,
             (client.latency_stat.mean() as u64).pretty_print(),
             (client.latency_stat.value_at_quantile(0.99) as u64).pretty_print(),
-            client.error_latency_stat.len(),
         );
+        for error in client.error_latency_stat.keys() {
+            println!(
+                "error {:?} {:?}, mean: {}, p99: {}",
+                error,
+                client.error_latency_stat[error].len(),
+                (client.error_latency_stat[error].mean() as u64).pretty_print(),
+                (client.error_latency_stat[error].value_at_quantile(0.99) as u64).pretty_print(),
+            );
+        }
     }
 
     for server in model.servers {
-        println!("server {}", server.server_id);
+        println!("\nserver {}", server.server_id);
         println!(
             "resolved-ts {}, safe-ts {}",
             server.resolved_ts.pretty_print(),
@@ -377,7 +385,7 @@ impl Server {
                 }
                 // some worker is idle, schedule now
                 let worker_id = self.read_workers.iter().position(|w| w.is_none()).unwrap();
-                self.schedule_to_read_worker(worker_id, task, now());
+                self.handle_read(worker_id, task, now());
             }
             EventType::PrewriteRequest | EventType::CommitRequest => {
                 // FCFS, no timeout
@@ -389,7 +397,7 @@ impl Server {
                 }
                 // some worker is idle, schedule now
                 let worker_id = self.write_workers.iter().position(|w| w.is_none()).unwrap();
-                self.schedule_to_write_worker(worker_id, task, now());
+                self.handle_write(worker_id, task, now());
             }
             _ => unreachable!(),
         }
@@ -397,15 +405,41 @@ impl Server {
 
     // a worker is idle, schedule a task onto it now.
     // Invariant: the worker is idle.
-    fn schedule_to_read_worker(&mut self, worker_id: usize, req: Request, accept_time: Time) {
+    fn handle_read(&mut self, worker_id: usize, req: Request, accept_time: Time) {
         assert!(self.read_workers[worker_id].is_none());
         self.read_schedule_wait_stat
             .record(now() - accept_time)
             .unwrap();
 
         let task_size = req.size;
+        let stale_read_ts = req.stale_read_ts;
         self.read_workers[worker_id] = Some(req);
         let this_server_id = self.server_id;
+
+        // safe ts check
+        if let Some(stale_read_ts) = stale_read_ts {
+            if stale_read_ts > self.safe_ts {
+                // schedule next task in queue
+                let task = self.read_workers[worker_id].take().unwrap();
+                if let Some((accept_time, task)) = self.read_task_queue.pop_front() {
+                    self.handle_read(worker_id, task, accept_time);
+                }
+
+                // return DataIsNotReady error
+                self.events.borrow_mut().push(Event::new(
+                    now() + rpc_latency(false),
+                    EventType::Response,
+                    Box::new(move |model: &mut Model| {
+                        model
+                            .find_client_by_id(task.client_id)
+                            .on_resp(task, Some(Error::DataIsNotReady));
+                    }),
+                ));
+                return;
+            }
+        }
+
+        // timeout check
         if accept_time + self.read_timeout < now() + task_size {
             // will timeout. It tries for `read_timeout`, and then decide to abort.
             self.events.borrow_mut().push(Event::new(
@@ -414,10 +448,14 @@ impl Server {
                 Box::new(move |model: &mut Model| {
                     let this = model.find_server_by_id(this_server_id);
                     this.error_count += 1;
+
+                    // schedule next task in queue
                     let task = this.read_workers[worker_id].take().unwrap();
                     if let Some((accept_time, task)) = this.read_task_queue.pop_front() {
-                        this.schedule_to_read_worker(worker_id, task, accept_time);
+                        this.handle_read(worker_id, task, accept_time);
                     }
+
+                    // return response
                     model.events.borrow_mut().push(Event::new(
                         now() + rpc_latency(false),
                         EventType::Response,
@@ -432,15 +470,19 @@ impl Server {
             return;
         }
 
+        // handle read
         self.events.borrow_mut().push(Event::new(
             now() + task_size,
             EventType::HandleRead,
             Box::new(move |model: &mut Model| {
+                // schedule next task in queue
                 let this: &mut Server = model.find_server_by_id(this_server_id);
                 let task = this.read_workers[worker_id].take().unwrap();
                 if let Some((accept_time, task)) = this.read_task_queue.pop_front() {
-                    this.schedule_to_read_worker(worker_id, task, accept_time);
+                    this.handle_read(worker_id, task, accept_time);
                 }
+
+                // return response
                 model.events.borrow_mut().push(Event::new(
                     now() + rpc_latency(false),
                     EventType::Response,
@@ -452,7 +494,7 @@ impl Server {
         ));
     }
 
-    fn schedule_to_write_worker(&mut self, worker_id: usize, req: Request, accept_time: Time) {
+    fn handle_write(&mut self, worker_id: usize, req: Request, accept_time: Time) {
         assert!(self.write_workers[worker_id].is_none());
         self.write_schedule_wait_stat
             .record(now() - accept_time)
@@ -475,7 +517,7 @@ impl Server {
                 }
 
                 if let Some((accept_time, task)) = this.write_task_queue.pop_front() {
-                    this.schedule_to_write_worker(worker_id, task, accept_time);
+                    this.handle_write(worker_id, task, accept_time);
                 }
                 let this_zone = this.zone;
 
@@ -494,15 +536,22 @@ impl Server {
 }
 
 enum PeerSelectorState {
-    Read(ReaderState),
+    StaleRead(StaleReaderState),
+    NormalRead(NormalReaderState),
     Write(WriterState),
 }
 
-// local -> leader -> random follower -> error
-enum ReaderState {
+// local(stale) -> leader(normal) -> random follower(normal) -> error
+enum StaleReaderState {
+    LocalStale,
+    LeaderNormal,
+    RandomFollowerNormal,
+}
+
+enum NormalReaderState {
     Local,
-    Leader,
-    RandomFollower,
+    LeaderNormal,
+    RandomFollowerNormal,
 }
 
 enum WriterState {
@@ -513,14 +562,21 @@ enum WriterState {
 // TODO: this is a naive one, different from the one in client-go. Take care.
 struct PeerSelector {
     state: PeerSelectorState,
-    follower_ids_tried: HashSet<u64>,
+    // already tried to perform non-stale read on these servers, no matter they are leader or follower
+    server_ids_tried_for_normal_read: HashSet<u64>,
     local_zone: Zone,
 }
 
 impl PeerSelector {
     fn new(local: Zone, req: &Request) -> Self {
         let state = match req.req_type {
-            EventType::ReadRequest => PeerSelectorState::Read(ReaderState::Local),
+            EventType::ReadRequest => {
+                if req.stale_read_ts.is_some() {
+                    PeerSelectorState::StaleRead(StaleReaderState::LocalStale)
+                } else {
+                    PeerSelectorState::NormalRead(NormalReaderState::Local)
+                }
+            }
             EventType::PrewriteRequest | EventType::CommitRequest => {
                 PeerSelectorState::Write(WriterState::Leader)
             }
@@ -528,37 +584,48 @@ impl PeerSelector {
         };
         Self {
             state: state,
-            follower_ids_tried: HashSet::new(),
+            server_ids_tried_for_normal_read: HashSet::new(),
             local_zone: local,
         }
     }
 
-    fn next<'a>(&mut self, servers: &'a mut Vec<Server>) -> Option<&'a mut Server> {
+    fn next<'a>(
+        &mut self,
+        servers: &'a mut Vec<Server>,
+        req: &mut Request,
+    ) -> Option<&'a mut Server> {
         match &mut self.state {
-            PeerSelectorState::Read(state) => match state {
-                ReaderState::Local => {
-                    *state = ReaderState::Leader;
+            PeerSelectorState::StaleRead(state) => match state {
+                StaleReaderState::LocalStale => {
+                    assert_eq!(req.req_type, EventType::ReadRequest);
+                    assert!(req.stale_read_ts.is_some());
+                    *state = StaleReaderState::LeaderNormal;
                     let s = servers
                         .iter_mut()
                         .find(|s| s.zone == self.local_zone)
                         .unwrap();
-                    self.follower_ids_tried.insert(s.server_id);
                     Some(s)
                 }
-                ReaderState::Leader => {
-                    *state = ReaderState::RandomFollower;
+                StaleReaderState::LeaderNormal => {
+                    assert_eq!(req.req_type, EventType::ReadRequest);
+                    req.stale_read_ts = None;
+                    *state = StaleReaderState::RandomFollowerNormal;
                     let s = servers.iter_mut().find(|s| s.role == Role::Leader).unwrap();
+                    self.server_ids_tried_for_normal_read.insert(s.server_id);
                     Some(s)
                 }
-                ReaderState::RandomFollower => {
+                StaleReaderState::RandomFollowerNormal => {
+                    assert_eq!(req.req_type, EventType::ReadRequest);
+                    assert!(req.stale_read_ts.is_none());
                     let mut rng = rand::thread_rng();
                     let follower = servers
                         .iter_mut()
                         .filter(|s| s.role == Role::Follower)
-                        .filter(|s| !self.follower_ids_tried.contains(&s.server_id))
+                        .filter(|s| !self.server_ids_tried_for_normal_read.contains(&s.server_id))
                         .choose(&mut rng);
                     if let Some(ref follower) = follower {
-                        self.follower_ids_tried.insert(follower.server_id);
+                        self.server_ids_tried_for_normal_read
+                            .insert(follower.server_id);
                     }
                     follower
                 }
@@ -571,6 +638,38 @@ impl PeerSelector {
                 }
                 WriterState::LeaderFailed => None,
             },
+            PeerSelectorState::NormalRead(state) => match state {
+                NormalReaderState::Local => {
+                    assert_eq!(req.req_type, EventType::ReadRequest);
+                    let s = servers.iter_mut().find(|s| s.zone == self.local_zone);
+                    if let Some(s) = &s {
+                        self.server_ids_tried_for_normal_read.insert(s.server_id);
+                    }
+                    s
+                }
+                NormalReaderState::LeaderNormal => {
+                    assert_eq!(req.req_type, EventType::ReadRequest);
+                    let s = servers.iter_mut().find(|s| s.role == Role::Leader);
+                    if let Some(s) = &s {
+                        self.server_ids_tried_for_normal_read.insert(s.server_id);
+                    }
+                    s
+                }
+                NormalReaderState::RandomFollowerNormal => {
+                    assert_eq!(req.req_type, EventType::ReadRequest);
+                    let mut rng = rand::thread_rng();
+                    let follower = servers
+                        .iter_mut()
+                        .filter(|s| s.role == Role::Follower)
+                        .filter(|s| !self.server_ids_tried_for_normal_read.contains(&s.server_id))
+                        .choose(&mut rng);
+                    if let Some(ref follower) = follower {
+                        self.server_ids_tried_for_normal_read
+                            .insert(follower.server_id);
+                    }
+                    follower
+                }
+            },
         }
     }
 }
@@ -582,7 +681,7 @@ struct Client {
     // req_id -> (start_time, replica selector)
     pending_tasks: HashMap<u64, (Time, Rc<RefCell<PeerSelector>>)>,
     latency_stat: Histogram<Time>,
-    error_latency_stat: Histogram<Time>,
+    error_latency_stat: HashMap<Error, Histogram<Time>>,
 }
 
 impl Client {
@@ -593,8 +692,7 @@ impl Client {
             events,
             pending_tasks: HashMap::new(),
             latency_stat: Histogram::<Time>::new_with_bounds(NANOSECOND, 60 * SECOND, 3).unwrap(),
-            error_latency_stat: Histogram::<Time>::new_with_bounds(NANOSECOND, 60 * SECOND, 3)
-                .unwrap(),
+            error_latency_stat: HashMap::new(),
         }
     }
 
@@ -609,14 +707,14 @@ impl Client {
     }
 
     // send the req to the appropriate peer. If all peers have been tried, return error to app.
-    fn issue_request(&mut self, req: Request, selector: Rc<RefCell<PeerSelector>>) {
+    fn issue_request(&mut self, mut req: Request, selector: Rc<RefCell<PeerSelector>>) {
         // we should decide the target *now*, but to access the server list in the model, we decide when
         // the event the rpc is to be accepted by the server.
         self.events.borrow_mut().push(Event::new(
             now() + rpc_latency(false),
             req.req_type,
             Box::new(move |model: &mut Model| {
-                let server = selector.borrow_mut().next(&mut model.servers);
+                let server = selector.borrow_mut().next(&mut model.servers, &mut req);
                 if let Some(server) = server {
                     server.on_req(req);
                 } else {
@@ -641,6 +739,10 @@ impl Client {
 
         if error.is_some() {
             self.error_latency_stat
+                .entry(error.unwrap())
+                .or_insert_with(|| {
+                    Histogram::<Time>::new_with_bounds(NANOSECOND, 60 * SECOND, 3).unwrap()
+                })
                 .record((now() - start_time) / NANOSECOND)
                 .unwrap();
             // retry other peers
@@ -669,18 +771,26 @@ struct App {
     // start_ts => transaction.
     pending_transactions: HashMap<Time, Transaction>,
     txn_duration_stat: Histogram<Time>,
+    read_staleness: Option<Time>,
 }
 
 enum CommitPhase {
+    // For read-write transactions.
     NotYet,
     Prewriting,
     Committing,
     Committed,
+    // read-only transaction doesn't need to commit.
+    ReadOnly,
 }
 
 struct Transaction {
     zone: Zone,
+    // start_ts, also the unique id of transactions
     start_ts: u64,
+    // for read-only stale read transactions
+    // invariant: must be smaller than start_ts and now().
+    stale_read_ts: Option<u64>,
     commit_ts: u64,
     num_queries: u64,
     finished_queries: u64,
@@ -688,36 +798,51 @@ struct Transaction {
 }
 
 impl Transaction {
-    fn new(num_queries: u64) -> Self {
+    fn new(num_queries: u64, read_only: bool, read_staleness: Option<Time>) -> Self {
+        assert!(read_staleness.is_none() || read_only);
         Self {
             zone: Zone::rand_zone(),
             start_ts: now(),
             commit_ts: 0,
             num_queries,
             finished_queries: 0,
-            commit_phase: CommitPhase::NotYet,
+            commit_phase: if read_only {
+                CommitPhase::ReadOnly
+            } else {
+                CommitPhase::NotYet
+            },
+            stale_read_ts: read_staleness.map(|staleness| now().saturating_sub(staleness)),
         }
     }
 }
 
 impl App {
-    fn new(events: Events, req_rate: f64) -> Self {
+    // req_rate: transactions per second
+    fn new(events: Events, txn_rate: f64, read_staleness: Option<Time>) -> Self {
         Self {
             events,
             rng: StdRng::from_seed(OsRng.gen()),
-            rate_exp_dist: Exp::new(req_rate).unwrap(),
+            rate_exp_dist: Exp::new(txn_rate).unwrap(),
             pending_transactions: HashMap::new(),
             txn_duration_stat: Histogram::<Time>::new_with_bounds(NANOSECOND, 60 * SECOND, 3)
                 .unwrap(),
+            read_staleness,
         }
     }
 
     fn gen_txn(&mut self) {
-        let txn = Transaction::new(6);
+        // 5% read-write, 95% read-only transactions.
+        let read_only = rand::random::<u64>() % 20 > 0;
+        let txn = Transaction::new(
+            6,
+            read_only,
+            if read_only { self.read_staleness } else { None },
+        );
         let start_ts = txn.start_ts;
         let zone = txn.zone;
+        let stale_read_ts = txn.stale_read_ts;
         self.pending_transactions.insert(txn.start_ts, txn);
-        self.issue_new_read_request(start_ts, zone);
+        self.issue_new_read_request(start_ts, stale_read_ts, zone);
 
         // Invariant: interval must be > 0, to avoid infinite loop.
         // And to make start_ts unique as start_ts is using now() directly
@@ -735,6 +860,23 @@ impl App {
         if error.is_none() {
             let txn = self.pending_transactions.get_mut(&req.start_ts).unwrap();
             match txn.commit_phase {
+                CommitPhase::ReadOnly => {
+                    // no need to prewrite and commit. finish all read queries
+                    txn.finished_queries += 1;
+                    if txn.finished_queries == txn.num_queries {
+                        txn.commit_phase = CommitPhase::Committed;
+                        self.txn_duration_stat
+                            .record((now() - txn.start_ts) / NANOSECOND)
+                            .unwrap();
+                        self.pending_transactions.remove(&req.start_ts);
+                    } else {
+                        // send next query
+                        let start_ts = txn.start_ts;
+                        let zone = txn.zone;
+                        let stale_read_ts = txn.stale_read_ts;
+                        self.issue_new_read_request(start_ts, stale_read_ts, zone);
+                    }
+                }
                 CommitPhase::NotYet => {
                     assert!(txn.finished_queries < txn.num_queries);
                     txn.finished_queries += 1;
@@ -744,6 +886,7 @@ impl App {
                         let zone = txn.zone;
                         let prewrite_req = Request::new(
                             txn.start_ts,
+                            None,
                             EventType::PrewriteRequest,
                             (rand::random::<u64>() % 5 + 1) * MILLISECOND,
                             u64::MAX,
@@ -753,7 +896,8 @@ impl App {
                         // send next query
                         let start_ts = txn.start_ts;
                         let zone = txn.zone;
-                        self.issue_new_read_request(start_ts, zone);
+                        let stale_read_ts = txn.stale_read_ts;
+                        self.issue_new_read_request(start_ts, stale_read_ts, zone);
                     }
                 }
                 CommitPhase::Prewriting => {
@@ -763,6 +907,7 @@ impl App {
                     txn.commit_ts = now();
                     let commit_req = Request::new(
                         txn.start_ts,
+                        None,
                         EventType::CommitRequest,
                         (rand::random::<u64>() % 5 + 1) * MILLISECOND,
                         u64::MAX,
@@ -797,10 +942,11 @@ impl App {
         ));
     }
 
-    fn issue_new_read_request(&mut self, start_ts: u64, zone: Zone) {
+    fn issue_new_read_request(&mut self, start_ts: u64, stale_read_ts: Option<u64>, zone: Zone) {
         // size of 1 - 5 ms
         let req = Request::new(
             start_ts,
+            stale_read_ts,
             EventType::ReadRequest,
             (rand::random::<u64>() % 5 + 1) * MILLISECOND,
             u64::MAX,
@@ -831,6 +977,7 @@ fn rpc_latency(remote: bool) -> u64 {
 #[derive(Clone)]
 struct Request {
     start_ts: u64,
+    stale_read_ts: Option<u64>,
     req_type: EventType,
     req_id: u64,
     client_id: u64,
@@ -839,9 +986,16 @@ struct Request {
 }
 
 impl Request {
-    fn new(start_ts: u64, req_type: EventType, size: Time, client_id: u64) -> Self {
+    fn new(
+        start_ts: u64,
+        stale_read_ts: Option<u64>,
+        req_type: EventType,
+        size: Time,
+        client_id: u64,
+    ) -> Self {
         Self {
             start_ts,
+            stale_read_ts,
             req_type,
             req_id: TASK_COUNTER.fetch_add(1, atomic::Ordering::SeqCst),
             client_id,
@@ -934,10 +1088,11 @@ enum EventType {
     AppGen,
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 enum Error {
     // server is busy - deadline exceeded
     ReadTimeout,
     // all servers are unavailable
     RegionUnavailable,
+    DataIsNotReady,
 }
