@@ -64,32 +64,93 @@ lazy_static! {
     };
 }
 
+fn now() -> Time {
+    CURRENT_TIME.load(atomic::Ordering::SeqCst)
+}
+
+fn rpc_latency(remote: bool) -> u64 {
+    let mut rng = rand::thread_rng();
+    let t = if remote {
+        REMOTE_NET_LATENCY_DIST.sample(&mut rng) as u64
+    } else {
+        LOCAL_NET_LATENCY_DIST.sample(&mut rng) as u64
+    };
+    if t > 60 * SECOND {
+        panic!("invalid rpc latency: {}", t);
+    }
+    t
+}
+
+#[derive(Clone)]
+struct Config {
+    replica_num: usize,
+    region_num: u64,
+    max_time: Time,
+    server_config: ServerConfig,
+    app_config: AppConfig,
+}
+
+#[derive(Clone)]
+struct ServerConfig {
+    num_read_workers: usize,
+    num_write_workers: usize,
+    read_timeout: Time,
+    advance_interval: Time,
+    broadcast_interval: Time,
+}
+
+#[derive(Clone)]
+struct AppConfig {
+    // transactions per second
+    txn_rate: f64,
+    read_staleness: Option<Time>,
+    read_size_fn: Rc<dyn Fn() -> Time>,
+    write_size_fn: Rc<dyn Fn() -> Time>,
+}
+
 fn main() {
     let events: Rc<RefCell<EventHeap>> = Rc::new(RefCell::new(EventHeap::new()));
+    let config = Config {
+        replica_num: 3,
+        region_num: 100,
+        max_time: 60 * SECOND,
+        server_config: ServerConfig {
+            num_read_workers: 4,
+            num_write_workers: 10,
+            read_timeout: 1 * SECOND,
+            advance_interval: 5 * SECOND,
+            broadcast_interval: 5 * SECOND,
+        },
+        app_config: AppConfig {
+            txn_rate: 500.0,
+            read_staleness: Some(15 * SECOND),
+            read_size_fn: Rc::new(|| (rand::random::<u64>() % 5 + 1) * MILLISECOND),
+            write_size_fn: Rc::new(|| (rand::random::<u64>() % 10 + 1) * MILLISECOND),
+        },
+    };
 
     let mut model = Model {
-        replica_num: 3,
+        replica_num: config.replica_num,
         events: events.clone(),
         servers: vec![
-            Server::new(Zone::AZ1, events.clone(), 4, 20, 1 * SECOND),
-            Server::new(Zone::AZ2, events.clone(), 4, 20, 1 * SECOND),
-            Server::new(Zone::AZ3, events.clone(), 4, 20, 1 * SECOND),
+            Server::new(Zone::AZ1, events.clone(), &config),
+            Server::new(Zone::AZ2, events.clone(), &config),
+            Server::new(Zone::AZ3, events.clone(), &config),
         ],
         clients: vec![
             Client::new(Zone::AZ1, events.clone()),
             Client::new(Zone::AZ2, events.clone()),
             Client::new(Zone::AZ3, events.clone()),
         ],
-        app: App::new(events.clone(), 5000.0, Some(15 * SECOND), 100),
+        app: App::new(events.clone(), &config),
     };
-    model.init();
-    let max_time = 60 * SECOND;
+    model.init(&config);
 
     loop {
         let mut events_mut = events.borrow_mut();
         if events_mut
             .peek()
-            .map(|e| e.trigger_time > max_time)
+            .map(|e| e.trigger_time > config.max_time)
             .unwrap_or(true)
         {
             break;
@@ -122,7 +183,7 @@ fn main() {
     println!(
         "txn duration mean: {}, p99: {}",
         (model.app.txn_duration_stat.mean() as u64).pretty_print(),
-        (model.app.txn_duration_stat.value_at_quantile(0.99) as u64).pretty_print()
+        (model.app.txn_duration_stat.value_at_quantile(0.99)).pretty_print()
     );
 
     for client in model.clients {
@@ -130,7 +191,7 @@ fn main() {
             "\nclient {:?} mean: {}, p99: {}",
             client.id,
             (client.latency_stat.mean() as u64).pretty_print(),
-            (client.latency_stat.value_at_quantile(0.99) as u64).pretty_print(),
+            (client.latency_stat.value_at_quantile(0.99)).pretty_print(),
         );
         for error in client.error_latency_stat.keys() {
             println!(
@@ -138,7 +199,7 @@ fn main() {
                 error,
                 client.error_latency_stat[error].len(),
                 (client.error_latency_stat[error].mean() as u64).pretty_print(),
-                (client.error_latency_stat[error].value_at_quantile(0.99) as u64).pretty_print(),
+                (client.error_latency_stat[error].value_at_quantile(0.99)).pretty_print(),
             );
         }
     }
@@ -151,14 +212,14 @@ fn main() {
             server.read_task_queue.len(),
             server.error_count,
             (server.read_schedule_wait_stat.mean() as u64).pretty_print(),
-            (server.read_schedule_wait_stat.value_at_quantile(0.99) as u64).pretty_print(),
+            (server.read_schedule_wait_stat.value_at_quantile(0.99)).pretty_print(),
         );
         println!(
             "handled {} write requests, {} in queue, schedule wait mean: {}, p99: {}",
             server.write_schedule_wait_stat.len(),
             server.write_task_queue.len(),
             (server.write_schedule_wait_stat.mean() as u64).pretty_print(),
-            (server.write_schedule_wait_stat.value_at_quantile(0.99) as u64).pretty_print(),
+            (server.write_schedule_wait_stat.value_at_quantile(0.99)).pretty_print(),
         );
     }
 }
@@ -172,7 +233,7 @@ struct Model {
 }
 
 impl Model {
-    fn init(&mut self) {
+    fn init(&mut self, cfg: &Config) {
         // create regions
         assert!(self.servers.len() >= self.replica_num);
         let mut leader_idx = 0;
@@ -185,8 +246,8 @@ impl Model {
                 resolved_ts: 0,
                 safe_ts: 0,
                 lock_cf: HashSet::new(),
-                advance_interval: 5 * SECOND,
-                broadcast_interval: 5 * SECOND,
+                advance_interval: cfg.server_config.advance_interval,
+                broadcast_interval: cfg.server_config.broadcast_interval,
             };
             leader.update_resolved_ts(self.events.clone());
             leader.broadcast_safe_ts(self.events.clone());
@@ -203,8 +264,8 @@ impl Model {
                         resolved_ts: 0,
                         safe_ts: 0,
                         lock_cf: HashSet::new(),
-                        advance_interval: 5 * SECOND,
-                        broadcast_interval: 5 * SECOND,
+                        advance_interval: cfg.server_config.advance_interval,
+                        broadcast_interval: cfg.server_config.broadcast_interval,
                     },
                 );
             }
@@ -366,25 +427,19 @@ struct Server {
 }
 
 impl Server {
-    fn new(
-        zone: Zone,
-        events: Events,
-        num_read_workers: usize,
-        num_write_workers: usize,
-        read_timeout: Time,
-    ) -> Self {
+    fn new(zone: Zone, events: Events, cfg: &Config) -> Self {
         let ret = Self {
             server_id: SERVER_COUNTER.fetch_add(1, atomic::Ordering::SeqCst),
             peers: HashMap::new(),
             zone,
             events,
             read_task_queue: VecDeque::new(),
-            read_workers: vec![None; num_read_workers],
+            read_workers: vec![None; cfg.server_config.num_read_workers],
             write_task_queue: VecDeque::new(),
-            write_workers: vec![None; num_write_workers],
+            write_workers: vec![None; cfg.server_config.num_write_workers],
             read_schedule_wait_stat: Histogram::<Time>::new_with_bounds(NANOSECOND, 60 * SECOND, 3)
                 .unwrap(),
-            read_timeout,
+            read_timeout: cfg.server_config.read_timeout,
             error_count: 0,
             write_schedule_wait_stat: Histogram::<Time>::new_with_bounds(
                 NANOSECOND,
@@ -809,6 +864,9 @@ struct App {
     read_staleness: Option<Time>,
     region_num: u64,
     retry_count: u64,
+
+    read_size_fn: Rc<dyn Fn() -> Time>,
+    write_size_fn: Rc<dyn Fn() -> Time>,
 }
 
 enum CommitPhase {
@@ -842,6 +900,8 @@ impl Transaction {
         read_only: bool,
         read_staleness: Option<Time>,
         region_num: u64,
+        read_size_fn: Rc<dyn Fn() -> Time>,
+        write_size_fn: Rc<dyn Fn() -> Time>,
     ) -> Self {
         assert!(read_staleness.is_none() || read_only);
         // we assume at least 1 query.
@@ -854,7 +914,7 @@ impl Transaction {
                 start_ts,
                 stale_read_ts,
                 EventType::ReadRequest,
-                (rand::random::<u64>() % 5 + 1) * MILLISECOND,
+                read_size_fn(),
                 u64::MAX,
                 rand::random::<u64>() % region_num,
             ));
@@ -866,7 +926,7 @@ impl Transaction {
                 start_ts,
                 None,
                 EventType::PrewriteRequest,
-                (rand::random::<u64>() % 5 + 1) * MILLISECOND,
+                write_size_fn(),
                 u64::MAX,
                 write_region,
             ));
@@ -874,7 +934,7 @@ impl Transaction {
                 start_ts,
                 None,
                 EventType::CommitRequest,
-                (rand::random::<u64>() % 5 + 1) * MILLISECOND,
+                write_size_fn(),
                 u64::MAX,
                 write_region,
             ));
@@ -899,17 +959,19 @@ impl Transaction {
 
 impl App {
     // req_rate: transactions per second
-    fn new(events: Events, txn_rate: f64, read_staleness: Option<Time>, region_num: u64) -> Self {
+    fn new(events: Events, cfg: &Config) -> Self {
         Self {
             events,
             rng: StdRng::from_seed(OsRng.gen()),
-            rate_exp_dist: Exp::new(txn_rate).unwrap(),
+            rate_exp_dist: Exp::new(cfg.app_config.txn_rate).unwrap(),
             pending_transactions: HashMap::new(),
             txn_duration_stat: Histogram::<Time>::new_with_bounds(NANOSECOND, 60 * SECOND, 3)
                 .unwrap(),
-            read_staleness,
-            region_num,
+            read_staleness: cfg.app_config.read_staleness,
+            region_num: cfg.region_num,
             retry_count: 0,
+            read_size_fn: cfg.app_config.read_size_fn.clone(),
+            write_size_fn: cfg.app_config.write_size_fn.clone(),
         }
     }
 
@@ -921,6 +983,8 @@ impl App {
             read_only,
             if read_only { self.read_staleness } else { None },
             self.region_num,
+            self.read_size_fn.clone(),
+            self.write_size_fn.clone(),
         );
         let zone = txn.zone;
         let req = txn.remaining_queries.pop_front().unwrap();
@@ -1007,23 +1071,6 @@ impl App {
             }),
         ));
     }
-}
-
-fn now() -> Time {
-    CURRENT_TIME.load(atomic::Ordering::SeqCst)
-}
-
-fn rpc_latency(remote: bool) -> u64 {
-    let mut rng = rand::thread_rng();
-    let t = if remote {
-        REMOTE_NET_LATENCY_DIST.sample(&mut rng) as u64
-    } else {
-        LOCAL_NET_LATENCY_DIST.sample(&mut rng) as u64
-    };
-    if t > 60 * SECOND {
-        panic!("invalid rpc latency: {}", t);
-    }
-    t
 }
 
 // a request, its content are permanent and immutable, even if it's sent to multiple servers.
