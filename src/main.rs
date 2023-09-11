@@ -1,7 +1,7 @@
 use hdrhistogram::Histogram;
 use lazy_static::lazy_static;
 use std::cell::RefCell;
-use std::cmp::{min, Ordering};
+use std::cmp::{max, min, Ordering};
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::atomic;
@@ -107,6 +107,7 @@ struct AppConfig {
     read_size_fn: Rc<dyn Fn() -> Time>,
     write_size_fn: Rc<dyn Fn() -> Time>,
     num_queries_fn: Rc<dyn Fn() -> u64>,
+    read_only_ratio: f64,
 }
 
 fn main() {
@@ -124,10 +125,11 @@ fn main() {
         },
         app_config: AppConfig {
             txn_rate: 500.0,
-            read_staleness: Some(15 * SECOND),
+            read_staleness: Some(20 * SECOND),
             read_size_fn: Rc::new(|| (rand::random::<u64>() % 5 + 1) * MILLISECOND),
             write_size_fn: Rc::new(|| (rand::random::<u64>() % 10 + 1) * MILLISECOND),
             num_queries_fn: Rc::new(|| 6),
+            read_only_ratio: 0.999,
         },
     };
 
@@ -195,13 +197,22 @@ fn main() {
             (client.latency_stat.mean() as u64).pretty_print(),
             (client.latency_stat.value_at_quantile(0.99)).pretty_print(),
         );
-        for error in client.error_latency_stat.keys() {
+        for (success, stat) in client.success_latency_stat {
+            println!(
+                "success {:?} {:?}, mean: {}, p99: {}",
+                success,
+                stat.len(),
+                (stat.mean() as u64).pretty_print(),
+                (stat.value_at_quantile(0.99)).pretty_print(),
+            );
+        }
+        for (error, stat) in client.error_latency_stat {
             println!(
                 "error {:?} {:?}, mean: {}, p99: {}",
                 error,
-                client.error_latency_stat[error].len(),
-                (client.error_latency_stat[error].mean() as u64).pretty_print(),
-                (client.error_latency_stat[error].value_at_quantile(0.99)).pretty_print(),
+                stat.len(),
+                (stat.mean() as u64).pretty_print(),
+                (stat.value_at_quantile(0.99)).pretty_print(),
             );
         }
     }
@@ -227,8 +238,8 @@ fn main() {
             "advance of resolved-ts failed {} times",
             server
                 .peers
-                .iter()
-                .map(|(_, p)| p.fail_advance_resolved_ts_stat)
+                .values()
+                .map(|p| p.fail_advance_resolved_ts_stat)
                 .sum::<u64>()
         )
     }
@@ -375,11 +386,11 @@ impl Peer {
         assert!(self.role == Role::Leader);
         let min_lock = *self.lock_cf.iter().min().unwrap_or(&u64::MAX);
         let new_resolved_ts = min(now(), min_lock);
-        if new_resolved_ts <= self.resolved_ts {
+        if new_resolved_ts <= self.resolved_ts && now() > 0 {
             assert!(self.resolved_ts == 0 || new_resolved_ts == min_lock);
             self.fail_advance_resolved_ts_stat += 1;
         }
-        self.resolved_ts = min(self.resolved_ts, new_resolved_ts);
+        self.resolved_ts = max(self.resolved_ts, new_resolved_ts);
         self.safe_ts = self.resolved_ts;
 
         let this_region_id = self.region_id;
@@ -783,6 +794,7 @@ struct Client {
     pending_tasks: HashMap<u64, (Time, Rc<RefCell<PeerSelector>>)>,
     latency_stat: Histogram<Time>,
     error_latency_stat: HashMap<Error, Histogram<Time>>,
+    success_latency_stat: HashMap<EventType, Histogram<Time>>,
 }
 
 impl Client {
@@ -794,6 +806,7 @@ impl Client {
             pending_tasks: HashMap::new(),
             latency_stat: Histogram::<Time>::new_with_bounds(NANOSECOND, 60 * SECOND, 3).unwrap(),
             error_latency_stat: HashMap::new(),
+            success_latency_stat: HashMap::new(),
         }
     }
 
@@ -834,21 +847,22 @@ impl Client {
 
     fn on_resp(&mut self, req: Request, error: Option<Error>) {
         let (start_time, selector) = self.pending_tasks.get(&req.req_id).unwrap();
-        self.latency_stat
-            .record((now() - start_time) / NANOSECOND)
-            .unwrap();
+        self.latency_stat.record(now() - start_time).unwrap();
 
         if let Some(e) = error {
             self.error_latency_stat
                 .entry(e)
-                .or_insert_with(|| {
-                    Histogram::<Time>::new_with_bounds(NANOSECOND, 60 * SECOND, 3).unwrap()
-                })
-                .record((now() - start_time) / NANOSECOND)
+                .or_insert_with(|| Histogram::<Time>::new_with_bounds(1, 60 * SECOND, 3).unwrap())
+                .record(now() - start_time)
                 .unwrap();
             // retry other peers
             self.issue_request(req, selector.clone());
         } else {
+            self.success_latency_stat
+                .entry(req.req_type)
+                .or_insert_with(|| Histogram::<Time>::new_with_bounds(1, 60 * SECOND, 3).unwrap())
+                .record(now() - start_time)
+                .unwrap();
             // success. respond to app
             self.pending_tasks.remove(&req.req_id);
             self.events.borrow_mut().push(Event::new(
@@ -879,6 +893,7 @@ struct App {
     read_size_fn: Rc<dyn Fn() -> Time>,
     write_size_fn: Rc<dyn Fn() -> Time>,
     num_queries_fn: Rc<dyn Fn() -> u64>,
+    read_only_ratio: f64,
 }
 
 enum CommitPhase {
@@ -985,12 +1000,13 @@ impl App {
             read_size_fn: cfg.app_config.read_size_fn.clone(),
             write_size_fn: cfg.app_config.write_size_fn.clone(),
             num_queries_fn: cfg.app_config.num_queries_fn.clone(),
+            read_only_ratio: cfg.app_config.read_only_ratio,
         }
     }
 
     fn gen_txn(&mut self) {
-        // 5% read-write, 95% read-only transactions.
-        let read_only = rand::random::<u64>() % 20 > 0;
+        // x% read-only, (1-x)% read-only transactions. independent of stale read
+        let read_only = rand::random::<f64>() < self.read_only_ratio;
         let mut txn = Transaction::new(
             (self.num_queries_fn)(),
             read_only,
@@ -1029,9 +1045,7 @@ impl App {
                         self.issue_request(zone, req);
                     } else {
                         txn.commit_phase = CommitPhase::Committed;
-                        self.txn_duration_stat
-                            .record((now() - txn.start_ts) / NANOSECOND)
-                            .unwrap();
+                        self.txn_duration_stat.record(now() - txn.start_ts).unwrap();
                         self.pending_transactions.remove(&req.start_ts);
                     }
                 }
@@ -1058,9 +1072,7 @@ impl App {
                 }
                 CommitPhase::Committing => {
                     txn.commit_phase = CommitPhase::Committed;
-                    self.txn_duration_stat
-                        .record((now() - txn.start_ts) / NANOSECOND)
-                        .unwrap();
+                    self.txn_duration_stat.record(now() - txn.start_ts).unwrap();
                     self.pending_transactions.remove(&req.start_ts);
                 }
                 CommitPhase::Committed => {
@@ -1188,7 +1200,7 @@ impl Ord for Event {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 enum EventType {
     HandleRead,
     HandleWrite,
