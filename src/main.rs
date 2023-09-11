@@ -117,7 +117,7 @@ fn main() {
         server_config: ServerConfig {
             num_read_workers: 4,
             num_write_workers: 10,
-            read_timeout: 1 * SECOND,
+            read_timeout: SECOND,
             advance_interval: 5 * SECOND,
             broadcast_interval: 5 * SECOND,
         },
@@ -276,7 +276,7 @@ impl Model {
         self.app.gen_txn();
     }
 
-    fn find_leader_by_id(servers: &mut Vec<Server>, region_id: u64) -> &mut Peer {
+    fn find_leader_by_id(servers: &mut [Server], region_id: u64) -> &mut Peer {
         servers
             .iter_mut()
             .find(|s| {
@@ -291,7 +291,7 @@ impl Model {
             .unwrap()
     }
 
-    fn find_followers_by_id(servers: &mut Vec<Server>, region_id: u64) -> Vec<&mut Peer> {
+    fn find_followers_by_id(servers: &mut [Server], region_id: u64) -> Vec<&mut Peer> {
         servers
             .iter_mut()
             .filter_map(|s| {
@@ -302,7 +302,7 @@ impl Model {
             .collect()
     }
 
-    fn find_server_by_id(servers: &mut Vec<Server>, server_id: u64) -> &mut Server {
+    fn find_server_by_id(servers: &mut [Server], server_id: u64) -> &mut Server {
         servers
             .iter_mut()
             .find(|s| s.server_id == server_id)
@@ -428,7 +428,7 @@ struct Server {
 
 impl Server {
     fn new(zone: Zone, events: Events, cfg: &Config) -> Self {
-        let ret = Self {
+        Self {
             server_id: SERVER_COUNTER.fetch_add(1, atomic::Ordering::SeqCst),
             peers: HashMap::new(),
             zone,
@@ -447,8 +447,7 @@ impl Server {
                 3,
             )
             .unwrap(),
-        };
-        ret
+        }
     }
 
     fn on_req(&mut self, task: Request) {
@@ -666,17 +665,13 @@ impl PeerSelector {
             _ => unreachable!(),
         };
         Self {
-            state: state,
+            state,
             server_ids_tried_for_normal_read: HashSet::new(),
             local_zone: local,
         }
     }
 
-    fn next<'a>(
-        &mut self,
-        servers: &'a mut Vec<Server>,
-        req: &mut Request,
-    ) -> Option<&'a mut Server> {
+    fn next<'a>(&mut self, servers: &'a mut [Server], req: &mut Request) -> Option<&'a mut Server> {
         match &mut self.state {
             PeerSelectorState::StaleRead(state) => match state {
                 StaleReaderState::LocalStale => {
@@ -827,9 +822,9 @@ impl Client {
             .record((now() - start_time) / NANOSECOND)
             .unwrap();
 
-        if error.is_some() {
+        if let Some(e) = error {
             self.error_latency_stat
-                .entry(error.unwrap())
+                .entry(e)
                 .or_insert_with(|| {
                     Histogram::<Time>::new_with_bounds(NANOSECOND, 60 * SECOND, 3).unwrap()
                 })
