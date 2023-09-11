@@ -83,8 +83,8 @@ fn rpc_latency(remote: bool) -> u64 {
 
 #[derive(Clone)]
 struct Config {
-    replica_num: usize,
-    region_num: u64,
+    num_replica: usize,
+    num_region: u64,
     max_time: Time,
     server_config: ServerConfig,
     app_config: AppConfig,
@@ -106,13 +106,14 @@ struct AppConfig {
     read_staleness: Option<Time>,
     read_size_fn: Rc<dyn Fn() -> Time>,
     write_size_fn: Rc<dyn Fn() -> Time>,
+    num_queries_fn: Rc<dyn Fn() -> u64>,
 }
 
 fn main() {
     let events: Rc<RefCell<EventHeap>> = Rc::new(RefCell::new(EventHeap::new()));
     let config = Config {
-        replica_num: 3,
-        region_num: 100,
+        num_replica: 3,
+        num_region: 100,
         max_time: 60 * SECOND,
         server_config: ServerConfig {
             num_read_workers: 4,
@@ -126,11 +127,12 @@ fn main() {
             read_staleness: Some(15 * SECOND),
             read_size_fn: Rc::new(|| (rand::random::<u64>() % 5 + 1) * MILLISECOND),
             write_size_fn: Rc::new(|| (rand::random::<u64>() % 10 + 1) * MILLISECOND),
+            num_queries_fn: Rc::new(|| 6),
         },
     };
 
     let mut model = Model {
-        replica_num: config.replica_num,
+        num_replica: config.num_replica,
         events: events.clone(),
         servers: vec![
             Server::new(Zone::AZ1, events.clone(), &config),
@@ -221,6 +223,14 @@ fn main() {
             (server.write_schedule_wait_stat.mean() as u64).pretty_print(),
             (server.write_schedule_wait_stat.value_at_quantile(0.99)).pretty_print(),
         );
+        println!(
+            "advance of resolved-ts failed {} times",
+            server
+                .peers
+                .iter()
+                .map(|(_, p)| p.fail_advance_resolved_ts_stat)
+                .sum::<u64>()
+        )
     }
 }
 
@@ -228,17 +238,17 @@ struct Model {
     events: Events,
     servers: Vec<Server>,
     clients: Vec<Client>,
-    replica_num: usize,
+    num_replica: usize,
     app: App,
 }
 
 impl Model {
     fn init(&mut self, cfg: &Config) {
         // create regions
-        assert!(self.servers.len() >= self.replica_num);
+        assert!(self.servers.len() >= self.num_replica);
         let mut leader_idx = 0;
-        for region_id in 0..self.app.region_num {
-            // leader in server[leader_idx], `replica_num-1` followers in server[leader_idx + 1]..server[leader_idx+replica_num-1]
+        for region_id in 0..self.app.num_region {
+            // leader in server[leader_idx], `num_replica - 1` followers in server[leader_idx + 1]..server[leader_idx + num_replica - 1]
             let mut leader = Peer {
                 role: Role::Leader,
                 server_id: self.servers[leader_idx].server_id,
@@ -248,11 +258,12 @@ impl Model {
                 lock_cf: HashSet::new(),
                 advance_interval: cfg.server_config.advance_interval,
                 broadcast_interval: cfg.server_config.broadcast_interval,
+                fail_advance_resolved_ts_stat: 0,
             };
             leader.update_resolved_ts(self.events.clone());
             leader.broadcast_safe_ts(self.events.clone());
             self.servers[leader_idx].peers.insert(region_id, leader);
-            for follow_id in 1..=self.replica_num - 1 {
+            for follow_id in 1..=self.num_replica - 1 {
                 let follower_idx = (leader_idx + follow_id) % self.servers.len();
                 let server_id = self.servers[follower_idx].server_id;
                 self.servers[follower_idx].peers.insert(
@@ -266,6 +277,7 @@ impl Model {
                         lock_cf: HashSet::new(),
                         advance_interval: cfg.server_config.advance_interval,
                         broadcast_interval: cfg.server_config.broadcast_interval,
+                        fail_advance_resolved_ts_stat: 0,
                     },
                 );
             }
@@ -355,6 +367,7 @@ struct Peer {
     safe_ts: u64,
     advance_interval: Time,
     broadcast_interval: Time,
+    fail_advance_resolved_ts_stat: u64,
 }
 
 impl Peer {
@@ -362,8 +375,11 @@ impl Peer {
         assert!(self.role == Role::Leader);
         let min_lock = *self.lock_cf.iter().min().unwrap_or(&u64::MAX);
         let new_resolved_ts = min(now(), min_lock);
-        assert!(new_resolved_ts >= self.resolved_ts);
-        self.resolved_ts = new_resolved_ts;
+        if new_resolved_ts <= self.resolved_ts {
+            assert!(self.resolved_ts == 0 || new_resolved_ts == min_lock);
+            self.fail_advance_resolved_ts_stat += 1;
+        }
+        self.resolved_ts = min(self.resolved_ts, new_resolved_ts);
         self.safe_ts = self.resolved_ts;
 
         let this_region_id = self.region_id;
@@ -857,11 +873,12 @@ struct App {
     pending_transactions: HashMap<Time, Transaction>,
     txn_duration_stat: Histogram<Time>,
     read_staleness: Option<Time>,
-    region_num: u64,
+    num_region: u64,
     retry_count: u64,
 
     read_size_fn: Rc<dyn Fn() -> Time>,
     write_size_fn: Rc<dyn Fn() -> Time>,
+    num_queries_fn: Rc<dyn Fn() -> u64>,
 }
 
 enum CommitPhase {
@@ -894,7 +911,7 @@ impl Transaction {
         num_queries: u64,
         read_only: bool,
         read_staleness: Option<Time>,
-        region_num: u64,
+        num_region: u64,
         read_size_fn: Rc<dyn Fn() -> Time>,
         write_size_fn: Rc<dyn Fn() -> Time>,
     ) -> Self {
@@ -911,12 +928,12 @@ impl Transaction {
                 EventType::ReadRequest,
                 read_size_fn(),
                 u64::MAX,
-                rand::random::<u64>() % region_num,
+                rand::random::<u64>() % num_region,
             ));
         }
         let (mut prewrite_req, mut commit_req) = (None, None);
         if !read_only {
-            let write_region = rand::random::<u64>() % region_num;
+            let write_region = rand::random::<u64>() % num_region;
             prewrite_req = Some(Request::new(
                 start_ts,
                 None,
@@ -963,10 +980,11 @@ impl App {
             txn_duration_stat: Histogram::<Time>::new_with_bounds(NANOSECOND, 60 * SECOND, 3)
                 .unwrap(),
             read_staleness: cfg.app_config.read_staleness,
-            region_num: cfg.region_num,
+            num_region: cfg.num_region,
             retry_count: 0,
             read_size_fn: cfg.app_config.read_size_fn.clone(),
             write_size_fn: cfg.app_config.write_size_fn.clone(),
+            num_queries_fn: cfg.app_config.num_queries_fn.clone(),
         }
     }
 
@@ -974,10 +992,10 @@ impl App {
         // 5% read-write, 95% read-only transactions.
         let read_only = rand::random::<u64>() % 20 > 0;
         let mut txn = Transaction::new(
-            6,
+            (self.num_queries_fn)(),
             read_only,
             if read_only { self.read_staleness } else { None },
-            self.region_num,
+            self.num_region,
             self.read_size_fn.clone(),
             self.write_size_fn.clone(),
         );
