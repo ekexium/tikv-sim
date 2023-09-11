@@ -124,12 +124,12 @@ fn main() {
             broadcast_interval: 5 * SECOND,
         },
         app_config: AppConfig {
-            txn_rate: 500.0,
+            txn_rate: 1500.0,
             read_staleness: Some(20 * SECOND),
             read_size_fn: Rc::new(|| (rand::random::<u64>() % 5 + 1) * MILLISECOND),
             write_size_fn: Rc::new(|| (rand::random::<u64>() % 10 + 1) * MILLISECOND),
             num_queries_fn: Rc::new(|| 6),
-            read_only_ratio: 0.999,
+            read_only_ratio: 0.95,
         },
     };
 
@@ -185,9 +185,19 @@ fn main() {
     );
 
     println!(
-        "txn duration mean: {}, p99: {}",
+        "txn duration min: {}, median: {}, mean: {}, p99: {}",
+        model.app.txn_duration_stat.min().pretty_print(),
+        model
+            .app
+            .txn_duration_stat
+            .value_at_quantile(0.5)
+            .pretty_print(),
         (model.app.txn_duration_stat.mean() as u64).pretty_print(),
-        (model.app.txn_duration_stat.value_at_quantile(0.99)).pretty_print()
+        model
+            .app
+            .txn_duration_stat
+            .value_at_quantile(0.99)
+            .pretty_print()
     );
 
     for client in model.clients {
@@ -208,9 +218,11 @@ fn main() {
         }
         for (error, stat) in client.error_latency_stat {
             println!(
-                "error {:?} {:?}, mean: {}, p99: {}",
+                "error {:?} {:?}, min: {}, median: {}, mean: {}, p99: {}",
                 error,
                 stat.len(),
+                stat.min().pretty_print(),
+                stat.value_at_quantile(0.5).pretty_print(),
                 (stat.mean() as u64).pretty_print(),
                 (stat.value_at_quantile(0.99)).pretty_print(),
             );
@@ -813,15 +825,14 @@ impl Client {
     // app sends a req to client
     fn on_req(&mut self, mut req: Request) {
         req.client_id = self.id;
-        let now = now();
         let selector = Rc::new(RefCell::new(PeerSelector::new(self.zone, &req)));
-        self.pending_tasks
-            .insert(req.req_id, (now, selector.clone()));
         self.issue_request(req, selector);
     }
 
     // send the req to the appropriate peer. If all peers have been tried, return error to app.
     fn issue_request(&mut self, mut req: Request, selector: Rc<RefCell<PeerSelector>>) {
+        self.pending_tasks
+            .insert(req.req_id, (now(), selector.clone()));
         // we should decide the target *now*, but to access the server list in the model, we decide when
         // the event the rpc is to be accepted by the server.
         self.events.borrow_mut().push(Event::new(
