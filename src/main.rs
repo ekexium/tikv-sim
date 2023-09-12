@@ -164,6 +164,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         server_read_queue_length: Default::default(),
         server_write_queue_length: Default::default(),
         advance_resolved_ts_failure: vec![],
+        server_read_worker_busy_time: vec![],
+        server_write_worker_busy_time: vec![],
     };
     model.init(&config);
 
@@ -185,16 +187,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (event.f)(&mut model);
     }
 
-    draw_metrics(&model)?;
+    draw_metrics(&model, &config)?;
     Ok(())
 }
 
-fn draw_metrics(model: &Model) -> Result<(), Box<dyn std::error::Error>> {
+fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
     use plotters::prelude::*;
-    let num_graphs = 11;
+    let num_graphs = 13;
     let root = SVGBackend::new("0.svg", (800, num_graphs * 600)).into_drawing_area();
     let children_area = root.split_evenly((num_graphs as usize, 1));
-    let xs = (0..model.app_ok_transaction_durations.len()).map(|i| i as f32);
+    let xs = (0..=model.app_ok_transaction_durations.len()).map(|i| i as f32);
     let font = ("Jetbrains Mono", 15).into_font();
     // elegant low-saturation colors
     let colors = [
@@ -592,7 +594,8 @@ fn draw_metrics(model: &Model) -> Result<(), Box<dyn std::error::Error>> {
                     .map(|x| x.values().copied().max().unwrap_or(0))
                     .max()
                     .unwrap() as f32
-                    * 1.2),
+                    * 1.2)
+                    .max(1.0),
             )?;
 
         chart.configure_mesh().disable_mesh().draw()?;
@@ -639,7 +642,8 @@ fn draw_metrics(model: &Model) -> Result<(), Box<dyn std::error::Error>> {
                     .map(|x| x.values().copied().max().unwrap_or(0))
                     .max()
                     .unwrap() as f32
-                    * 1.2),
+                    * 1.2)
+                    .max(1.0),
             )?;
 
         chart.configure_mesh().disable_mesh().draw()?;
@@ -722,7 +726,8 @@ fn draw_metrics(model: &Model) -> Result<(), Box<dyn std::error::Error>> {
                     .map(|x| x.values().max().unwrap_or(&0))
                     .max()
                     .unwrap_or(&0) as f32
-                    * 1.2),
+                    * 1.2)
+                    .max(1.0),
             )?;
 
         chart.configure_mesh().disable_mesh().draw()?;
@@ -741,6 +746,104 @@ fn draw_metrics(model: &Model) -> Result<(), Box<dyn std::error::Error>> {
                             .iter()
                             .map(|x| x.get(server_id).copied().unwrap_or(0) as f32),
                     ),
+                    colors[i],
+                ))?
+                .label(format!("server-{}", server_id))
+                .legend(move |(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], colors[i]));
+        }
+        chart
+            .configure_series_labels()
+            .position(SeriesLabelPosition::UpperLeft)
+            .background_style(WHITE.mix(0.5))
+            .draw()?;
+    }
+
+    // read worker utilization
+    {
+        chart_id += 1;
+        let mut chart = ChartBuilder::on(&children_area[chart_id])
+            .caption(
+                "read worker utilization (busy time / total time)",
+                font.clone(),
+            )
+            .margin(30)
+            .x_label_area_size(30)
+            .y_label_area_size(30)
+            .build_cartesian_2d(
+                0f32..model.server_read_worker_busy_time.len() as f32,
+                0f32..cfg.server_config.num_read_workers as f32 * 1.2 * 100.0,
+            )?;
+        let servers: HashSet<u64> = model
+            .server_read_worker_busy_time
+            .iter()
+            .flat_map(|x| x.keys())
+            .copied()
+            .collect();
+
+        chart
+            .configure_mesh()
+            .disable_mesh()
+            .y_label_formatter(&|x| format!("{}%", x))
+            .draw()?;
+
+        for (i, server_id) in servers.iter().enumerate() {
+            chart
+                .draw_series(LineSeries::new(
+                    xs.clone()
+                        .zip(model.server_read_worker_busy_time.iter().map(|x| {
+                            x.get(server_id).copied().unwrap_or(0) as f32
+                                / cfg.metrics_interval as f32
+                                * 100.0
+                        })),
+                    colors[i],
+                ))?
+                .label(format!("server-{}", server_id))
+                .legend(move |(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], colors[i]));
+        }
+        chart
+            .configure_series_labels()
+            .position(SeriesLabelPosition::UpperLeft)
+            .background_style(WHITE.mix(0.5))
+            .draw()?;
+    }
+
+    // write pool utilization
+    {
+        chart_id += 1;
+        let mut chart = ChartBuilder::on(&children_area[chart_id])
+            .caption(
+                "write worker utilization (busy time / total time)",
+                font.clone(),
+            )
+            .margin(30)
+            .x_label_area_size(30)
+            .y_label_area_size(30)
+            .build_cartesian_2d(
+                0f32..model.server_write_worker_busy_time.len() as f32,
+                0f32..cfg.server_config.num_write_workers as f32 * 1.2 * 100.0,
+            )?;
+        let servers: HashSet<u64> = model
+            .server_write_worker_busy_time
+            .iter()
+            .flat_map(|x| x.keys())
+            .copied()
+            .collect();
+
+        chart
+            .configure_mesh()
+            .disable_mesh()
+            .y_label_formatter(&|x| format!("{}%", x))
+            .draw()?;
+
+        for (i, server_id) in servers.iter().enumerate() {
+            chart
+                .draw_series(LineSeries::new(
+                    xs.clone()
+                        .zip(model.server_write_worker_busy_time.iter().map(|x| {
+                            x.get(server_id).copied().unwrap_or(0) as f32
+                                / cfg.metrics_interval as f32
+                                * 100.0
+                        })),
                     colors[i],
                 ))?
                 .label(format!("server-{}", server_id))
@@ -781,6 +884,10 @@ struct Model {
     server_write_queue_length: Vec<HashMap<u64, u64>>,
     // server id -> count
     advance_resolved_ts_failure: Vec<HashMap<u64, u64>>,
+    // server id -> total time
+    server_read_worker_busy_time: Vec<HashMap<u64, u64>>,
+    // server id -> total time
+    server_write_worker_busy_time: Vec<HashMap<u64, u64>>,
 }
 
 impl Model {
@@ -969,6 +1076,40 @@ impl Model {
             self.advance_resolved_ts_failure.push(map);
         }
 
+        {
+            let mut map = HashMap::new();
+            for server in &mut self.servers {
+                let mut t = server.read_worker_time;
+                // calculate those in workers
+                for worker in &mut server.read_workers {
+                    if let Some((start_time, _)) = worker {
+                        t += now() - *start_time;
+                        *start_time = now();
+                    }
+                }
+                server.read_worker_time = 0;
+                map.insert(server.server_id, t);
+            }
+            self.server_read_worker_busy_time.push(map);
+        }
+
+        {
+            let mut map = HashMap::new();
+            for server in &mut self.servers {
+                let mut t = server.write_worker_time;
+                // calculate those in workers
+                for worker in &mut server.write_workers {
+                    if let Some((start_time, _)) = worker {
+                        t += now() - *start_time;
+                        *start_time = now();
+                    }
+                }
+                server.write_worker_time = 0;
+                map.insert(server.server_id, t);
+            }
+            self.server_write_worker_busy_time.push(map);
+        }
+
         self.events.borrow_mut().push(Event::new(
             now() + self.metrics_interval,
             EventType::CollectMetrics,
@@ -1080,15 +1221,21 @@ struct Server {
     events: Events,
     // Vec<(accept time, task)>
     read_task_queue: VecDeque<(Time, Request)>,
-    read_workers: Vec<Option<Request>>,
-    read_schedule_wait_stat: Histogram<Time>,
-    read_timeout: Time,
-    // a read request will abort at this time if it cannot finish in time
-    error_count: u64,
-
     write_task_queue: VecDeque<(Time, Request)>,
-    write_workers: Vec<Option<Request>>,
+    // Vec<(start handle time, task)>, the start time can be reset when collecting metrics. this is **only** used to calculate utilization
+    read_workers: Vec<Option<(Time, Request)>>,
+    write_workers: Vec<Option<(Time, Request)>>,
+
+    // a read request will abort at this time if it cannot finish in time
+    read_timeout: Time,
+
+    // metrics
+    error_count: u64,
     write_schedule_wait_stat: Histogram<Time>,
+    read_schedule_wait_stat: Histogram<Time>,
+    // total busy time, in each metrics interval
+    read_worker_time: Time,
+    write_worker_time: Time,
 }
 
 impl Server {
@@ -1112,6 +1259,8 @@ impl Server {
                 3,
             )
             .unwrap(),
+            read_worker_time: 0,
+            write_worker_time: 0,
         }
     }
 
@@ -1154,14 +1303,14 @@ impl Server {
 
         let task_size = req.size;
         let stale_read_ts = req.stale_read_ts;
-        self.read_workers[worker_id] = Some(req);
+        self.read_workers[worker_id] = Some((now(), req));
         let this_server_id = self.server_id;
 
         // safe ts check
         if let Some(stale_read_ts) = stale_read_ts {
             if stale_read_ts > peer.safe_ts {
                 // schedule next task in queue
-                let task = self.read_workers[worker_id].take().unwrap();
+                let (_, task) = self.read_workers[worker_id].take().unwrap();
                 if let Some((accept_time, task)) = self.read_task_queue.pop_front() {
                     self.handle_read(worker_id, task, accept_time);
                 }
@@ -1191,7 +1340,8 @@ impl Server {
                     this.error_count += 1;
 
                     // schedule next task in queue
-                    let task = this.read_workers[worker_id].take().unwrap();
+                    let (start_time, task) = this.read_workers[worker_id].take().unwrap();
+                    this.read_worker_time += now() - start_time;
                     if let Some((accept_time, task)) = this.read_task_queue.pop_front() {
                         this.handle_read(worker_id, task, accept_time);
                     }
@@ -1219,7 +1369,8 @@ impl Server {
                 // schedule next task in queue
                 let this: &mut Server =
                     Model::find_server_by_id(&mut model.servers, this_server_id);
-                let task = this.read_workers[worker_id].take().unwrap();
+                let (start_time, task) = this.read_workers[worker_id].take().unwrap();
+                this.read_worker_time += now() - start_time;
                 if let Some((accept_time, task)) = this.read_task_queue.pop_front() {
                     this.handle_read(worker_id, task, accept_time);
                 }
@@ -1247,7 +1398,7 @@ impl Server {
         if req.req_type == EventType::PrewriteRequest {
             peer.lock_cf.insert(req.start_ts);
         }
-        self.write_workers[worker_id] = Some(req);
+        self.write_workers[worker_id] = Some((now(), req));
         let this_server_id = self.server_id;
         self.events.borrow_mut().push(Event::new(
             now() + req_size,
@@ -1255,7 +1406,8 @@ impl Server {
             Box::new(move |model: &mut Model| {
                 let this: &mut Server =
                     Model::find_server_by_id(&mut model.servers, this_server_id);
-                let task = this.write_workers[worker_id].take().unwrap();
+                let (start_time, task) = this.write_workers[worker_id].take().unwrap();
+                this.write_worker_time += now() - start_time;
                 let peer = this.peers.get_mut(&task.region_id).unwrap();
                 assert!(peer.role == Role::Leader);
 
@@ -1263,11 +1415,13 @@ impl Server {
                     assert!(peer.lock_cf.remove(&task.start_ts));
                 }
 
+                // schedule next task
                 if let Some((accept_time, task)) = this.write_task_queue.pop_front() {
                     this.handle_write(worker_id, task, accept_time);
                 }
                 let this_zone = this.zone;
 
+                // return resp
                 let client = model.find_client_by_id(task.client_id);
                 let remote = this_zone != client.zone;
                 model.events.borrow_mut().push(Event::new(
