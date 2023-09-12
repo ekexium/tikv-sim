@@ -124,22 +124,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         server_config: ServerConfig {
             num_read_workers: 10,
             num_write_workers: 10,
-            read_timeout: 1 * SECOND,
+            read_timeout: SECOND,
             advance_interval: 5 * SECOND,
             broadcast_interval: 5 * SECOND,
         },
         app_config: AppConfig {
             retry: false,
-            txn_rate: 5000.0,
-            read_staleness: Some(10 * SECOND),
-            read_size_fn: Rc::new(|| (rand::random::<u64>() % 1 + 1) * MILLISECOND),
+            txn_rate: 2000.0,
+            read_staleness: Some(SECOND),
+            read_size_fn: Rc::new(|| (rand::random::<u64>() % 5 + 1) * MILLISECOND),
             prewrite_size_fn: Rc::new(|| (rand::random::<u64>() % 30 + 1) * MILLISECOND),
             commit_size_fn: Rc::new(|| (rand::random::<u64>() % 20 + 1) * MILLISECOND),
             num_queries_fn: Rc::new(|| 10),
-            read_only_ratio: 0.05,
+            read_only_ratio: 0.95,
         },
     };
-    assert_eq!(config.metrics_interval, SECOND, "why bother");
+    // assert_eq!(config.metrics_interval, SECOND, "why bother");
 
     let mut model = Model {
         events: events.clone(),
@@ -185,18 +185,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (event.f)(&mut model);
     }
 
-    draw_metrics(&model, &config)?;
+    draw_metrics(&model)?;
     Ok(())
 }
 
-fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
+fn draw_metrics(model: &Model) -> Result<(), Box<dyn std::error::Error>> {
     use plotters::prelude::*;
     let num_graphs = 11;
-    let root = SVGBackend::new(
-        "0.svg",
-        ((cfg.max_time / SECOND * 15 + 200) as u32, num_graphs * 400),
-    )
-    .into_drawing_area();
+    let root = SVGBackend::new("0.svg", (800, num_graphs * 600)).into_drawing_area();
     let children_area = root.split_evenly((num_graphs as usize, 1));
     let xs = (0..model.app_ok_transaction_durations.len()).map(|i| i as f32);
     let font = ("Jetbrains Mono", 15).into_font();
@@ -215,22 +211,22 @@ fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::E
     ];
 
     let mut chart_id = 0;
-    // app_ok_tps
+    // app_ok_transaction_rate
     {
-        let txn_tps = model.app_ok_transaction_durations.iter().map(|b| b.len());
+        let txn_ok_rate = model.app_ok_transaction_durations.iter().map(|b| b.len());
         let mut chart = ChartBuilder::on(&children_area[chart_id])
-            .caption("successful TPS", font.clone())
+            .caption("successful transaction rate (per interval)", font.clone())
             .margin(30)
             .x_label_area_size(30)
             .y_label_area_size(30)
             .build_cartesian_2d(
                 0f32..model.app_ok_transaction_durations.len() as f32,
-                0f32..txn_tps.clone().max().unwrap() as f32 * 1.2,
+                0f32..txn_ok_rate.clone().max().unwrap() as f32 * 1.2,
             )?;
 
         chart.configure_mesh().disable_mesh().draw()?;
         chart.draw_series(LineSeries::new(
-            xs.clone().zip(txn_tps.map(|x| x as f32)),
+            xs.clone().zip(txn_ok_rate.map(|x| x as f32)),
             &colors[0],
         ))?;
     }
@@ -273,7 +269,7 @@ fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::E
                 &colors[0],
             ))?
             .label("mean")
-            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &colors[0]));
+            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], colors[0]));
         // p99 latency
         chart
             .draw_series(LineSeries::new(
@@ -286,20 +282,20 @@ fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::E
                 &colors[1],
             ))?
             .label("p99")
-            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &colors[1]));
+            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], colors[1]));
         // legend
         chart
             .configure_series_labels()
             .position(SeriesLabelPosition::UpperLeft)
-            .background_style(&WHITE.mix(0.5))
+            .background_style(WHITE.mix(0.5))
             .draw()?;
     }
 
-    // app error TPS
+    // app error rate
     {
         chart_id += 1;
         let mut chart = ChartBuilder::on(&children_area[chart_id])
-            .caption("app error TPS", font.clone())
+            .caption("app error rate (per interval)", font.clone())
             .margin(30)
             .x_label_area_size(30)
             .y_label_area_size(30)
@@ -318,8 +314,7 @@ fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::E
         let errors = model
             .app_fail_transaction_durations
             .iter()
-            .map(|x| x.keys())
-            .flatten()
+            .flat_map(|x| x.keys())
             .collect::<HashSet<_>>();
 
         for (i, error) in errors.iter().enumerate() {
@@ -339,37 +334,34 @@ fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::E
         chart
             .configure_series_labels()
             .position(SeriesLabelPosition::UpperLeft)
-            .background_style(&WHITE.mix(0.5))
+            .background_style(WHITE.mix(0.5))
             .draw()?;
     }
 
-    // KV QPS
+    // KV rate
     {
         chart_id += 1;
         let mut chart = ChartBuilder::on(&children_area[chart_id])
-            .caption("kv ok QPS", font.clone())
+            .caption("kv ok query rate (per interval)", font.clone())
             .margin(30)
             .x_label_area_size(30)
             .y_label_area_size(30)
             .build_cartesian_2d(
                 0f32..model.kv_ok_durations.len() as f32,
-                (0f32..model
+                0f32..model
                     .kv_ok_durations
                     .iter()
                     .map(|x| x.values().map(|x| x.len()).sum::<u64>())
                     .max()
                     .unwrap() as f32
-                    * 3.0)
-                    .log_scale()
-                    .base(2.0),
+                    * 1.2,
             )?;
 
-        chart.configure_mesh().disable_x_mesh().draw()?;
+        chart.configure_mesh().disable_mesh().draw()?;
         let errors = model
             .kv_ok_durations
             .iter()
-            .map(|x| x.keys())
-            .flatten()
+            .flat_map(|x| x.keys())
             .collect::<HashSet<_>>();
 
         for (i, error) in errors.iter().enumerate() {
@@ -389,7 +381,7 @@ fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::E
         chart
             .configure_series_labels()
             .position(SeriesLabelPosition::UpperLeft)
-            .background_style(&WHITE.mix(0.5))
+            .background_style(WHITE.mix(0.5))
             .draw()?;
     }
 
@@ -397,7 +389,7 @@ fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::E
     {
         chart_id += 1;
         let mut chart = ChartBuilder::on(&children_area[chart_id])
-            .caption("kv error rates", font.clone())
+            .caption("kv error rates (per interval)", font.clone())
             .margin(30)
             .x_label_area_size(30)
             .y_label_area_size(30)
@@ -416,8 +408,7 @@ fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::E
         let errors = model
             .kv_error_durations
             .iter()
-            .map(|x| x.keys())
-            .flatten()
+            .flat_map(|x| x.keys())
             .collect::<HashSet<_>>();
 
         for (i, error) in errors.iter().enumerate() {
@@ -437,7 +428,7 @@ fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::E
         chart
             .configure_series_labels()
             .position(SeriesLabelPosition::UpperLeft)
-            .background_style(&WHITE.mix(0.5))
+            .background_style(WHITE.mix(0.5))
             .draw()?;
     }
 
@@ -452,29 +443,26 @@ fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::E
             .y_label_area_size(30)
             .build_cartesian_2d(
                 0f32..model.kv_ok_durations.len() as f32,
-                (0f32..(model
+                0f32..(model
                     .kv_ok_durations
                     .iter()
                     .map(|x| x.values().map(|x| x.max()).max().unwrap_or(0))
                     .max()
                     .unwrap()
                     / y_unit) as f32
-                    * 3.0)
-                    .log_scale()
-                    .base(2.0),
+                    * 1.2,
             )?;
 
         chart
             .configure_mesh()
-            .disable_x_mesh()
+            .disable_mesh()
             .y_label_formatter(&|x| format!("{:.1}{}", x, y_label))
             .draw()?;
 
         let req_types = model
             .kv_ok_durations
             .iter()
-            .map(|x| x.keys())
-            .flatten()
+            .flat_map(|x| x.keys())
             .collect::<HashSet<_>>();
 
         // mean latency
@@ -502,7 +490,7 @@ fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::E
                             .unwrap_or(0.0)
                     })),
                     3f32,
-                    &colors[i],
+                    colors[i],
                 ))?
                 .label(req_type.to_string() + "-p99")
                 .legend(move |(x, y)| Circle::new((x, y), 3f32, colors[i]));
@@ -512,7 +500,7 @@ fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::E
         chart
             .configure_series_labels()
             .position(SeriesLabelPosition::UpperLeft)
-            .background_style(&WHITE.mix(0.5))
+            .background_style(WHITE.mix(0.5))
             .draw()?;
     }
 
@@ -540,8 +528,7 @@ fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::E
         let errors = model
             .kv_error_durations
             .iter()
-            .map(|x| x.keys())
-            .flatten()
+            .flat_map(|x| x.keys())
             .collect::<HashSet<_>>();
 
         chart
@@ -575,7 +562,7 @@ fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::E
                             .unwrap_or(0.0)
                     })),
                     3f32,
-                    &colors[i],
+                    colors[i],
                 ))?
                 .label(error.to_string() + "-p99")
                 .legend(move |(x, y)| Circle::new((x, y), 3f32, colors[i]));
@@ -585,7 +572,7 @@ fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::E
         chart
             .configure_series_labels()
             .position(SeriesLabelPosition::UpperLeft)
-            .background_style(&WHITE.mix(0.5))
+            .background_style(WHITE.mix(0.5))
             .draw()?;
     }
 
@@ -602,7 +589,7 @@ fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::E
                 0f32..(model
                     .server_read_queue_length
                     .iter()
-                    .map(|x| x.values().map(|x| *x).max().unwrap_or(0))
+                    .map(|x| x.values().copied().max().unwrap_or(0))
                     .max()
                     .unwrap() as f32
                     * 1.2),
@@ -612,8 +599,7 @@ fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::E
         let server_ids = model
             .server_read_queue_length
             .iter()
-            .map(|x| x.keys())
-            .flatten()
+            .flat_map(|x| x.keys())
             .collect::<HashSet<_>>();
 
         for (i, server_id) in server_ids.iter().enumerate() {
@@ -623,7 +609,7 @@ fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::E
                         model
                             .server_read_queue_length
                             .iter()
-                            .map(|x| x.get(server_id).map(|x| *x).unwrap_or(0) as f32),
+                            .map(|x| x.get(server_id).copied().unwrap_or(0) as f32),
                     ),
                     colors[i],
                 ))?
@@ -633,7 +619,7 @@ fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::E
         chart
             .configure_series_labels()
             .position(SeriesLabelPosition::UpperLeft)
-            .background_style(&WHITE.mix(0.5))
+            .background_style(WHITE.mix(0.5))
             .draw()?;
     }
 
@@ -650,7 +636,7 @@ fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::E
                 0f32..(model
                     .server_write_queue_length
                     .iter()
-                    .map(|x| x.values().map(|x| *x).max().unwrap_or(0))
+                    .map(|x| x.values().copied().max().unwrap_or(0))
                     .max()
                     .unwrap() as f32
                     * 1.2),
@@ -660,8 +646,7 @@ fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::E
         let server_ids = model
             .server_write_queue_length
             .iter()
-            .map(|x| x.keys())
-            .flatten()
+            .flat_map(|x| x.keys())
             .collect::<HashSet<_>>();
 
         for (i, server_id) in server_ids.iter().enumerate() {
@@ -671,7 +656,7 @@ fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::E
                         model
                             .server_write_queue_length
                             .iter()
-                            .map(|x| x.get(server_id).map(|x| *x).unwrap_or(0) as f32),
+                            .map(|x| x.get(server_id).copied().unwrap_or(0) as f32),
                     ),
                     colors[i],
                 ))?
@@ -681,7 +666,7 @@ fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::E
         chart
             .configure_series_labels()
             .position(SeriesLabelPosition::UpperLeft)
-            .background_style(&WHITE.mix(0.5))
+            .background_style(WHITE.mix(0.5))
             .draw()?;
     }
 
@@ -744,8 +729,7 @@ fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::E
         let server_ids = model
             .advance_resolved_ts_failure
             .iter()
-            .map(|x| x.keys())
-            .flatten()
+            .flat_map(|x| x.keys())
             .collect::<HashSet<_>>();
 
         for (i, server_id) in server_ids.iter().enumerate() {
@@ -755,7 +739,7 @@ fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::E
                         model
                             .advance_resolved_ts_failure
                             .iter()
-                            .map(|x| x.get(server_id).map(|x| *x).unwrap_or(0) as f32),
+                            .map(|x| x.get(server_id).copied().unwrap_or(0) as f32),
                     ),
                     colors[i],
                 ))?
@@ -765,7 +749,7 @@ fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::E
         chart
             .configure_series_labels()
             .position(SeriesLabelPosition::UpperLeft)
-            .background_style(&WHITE.mix(0.5))
+            .background_style(WHITE.mix(0.5))
             .draw()?;
     }
 
@@ -917,7 +901,7 @@ impl Model {
         {
             let mut map = HashMap::new();
             for (error, stat) in &mut self.app.failed_txn_stat {
-                map.insert(error.clone(), stat.clone());
+                map.insert(*error, stat.clone());
                 stat.reset();
             }
             self.app_fail_transaction_durations.push(map);
@@ -974,7 +958,7 @@ impl Model {
         {
             let mut map = HashMap::new();
             for server in &mut self.servers {
-                for (_, peer) in &mut server.peers {
+                for peer in &mut server.peers.values_mut() {
                     if peer.role == Role::Leader {
                         *map.entry(server.server_id).or_insert(0) +=
                             peer.fail_advance_resolved_ts_stat;
@@ -1697,7 +1681,25 @@ impl App {
     }
 
     fn on_resp(&mut self, req: Request, error: Option<Error>) {
-        if error.is_none() {
+        if let Some(error) = error {
+            if self.retry {
+                // application retry immediately
+                let txn = self.pending_transactions.get(&req.start_ts).unwrap();
+                self.retry_count += 1;
+                self.issue_request(txn.zone, req);
+            } else {
+                // application doesn't retry
+                let txn = self.pending_transactions.remove(&req.start_ts).unwrap();
+                self.failed_txn_stat
+                    .entry(error)
+                    .or_insert_with(|| {
+                        Histogram::<Time>::new_with_bounds(1, 60 * SECOND, 3).unwrap()
+                    })
+                    .record(now() - txn.start_ts)
+                    .unwrap();
+            }
+        } else {
+            // success
             let txn = self.pending_transactions.get_mut(&req.start_ts).unwrap();
             match txn.commit_phase {
                 CommitPhase::ReadOnly => {
@@ -1742,23 +1744,6 @@ impl App {
                 CommitPhase::Committed => {
                     unreachable!();
                 }
-            }
-        } else {
-            if self.retry {
-                // application retry immediately
-                let txn = self.pending_transactions.get(&req.start_ts).unwrap();
-                self.retry_count += 1;
-                self.issue_request(txn.zone, req);
-            } else {
-                // application doesn't retry
-                let txn = self.pending_transactions.remove(&req.start_ts).unwrap();
-                self.failed_txn_stat
-                    .entry(error.unwrap())
-                    .or_insert_with(|| {
-                        Histogram::<Time>::new_with_bounds(1, 60 * SECOND, 3).unwrap()
-                    })
-                    .record(now() - txn.start_ts)
-                    .unwrap();
             }
         }
     }
