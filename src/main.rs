@@ -101,6 +101,7 @@ struct ServerConfig {
 
 #[derive(Clone)]
 struct AppConfig {
+    retry: bool,
     // transactions per second
     txn_rate: f64,
     read_staleness: Option<Time>,
@@ -117,18 +118,19 @@ fn main() {
         num_region: 100,
         max_time: 60 * SECOND,
         server_config: ServerConfig {
-            num_read_workers: 4,
+            num_read_workers: 10,
             num_write_workers: 10,
-            read_timeout: SECOND,
+            read_timeout: 1 * SECOND,
             advance_interval: 5 * SECOND,
             broadcast_interval: 5 * SECOND,
         },
         app_config: AppConfig {
-            txn_rate: 1500.0,
-            read_staleness: Some(20 * SECOND),
-            read_size_fn: Rc::new(|| (rand::random::<u64>() % 5 + 1) * MILLISECOND),
-            write_size_fn: Rc::new(|| (rand::random::<u64>() % 10 + 1) * MILLISECOND),
-            num_queries_fn: Rc::new(|| 6),
+            retry: false,
+            txn_rate: 6000.0,
+            read_staleness: Some(10 * SECOND),
+            read_size_fn: Rc::new(|| (rand::random::<u64>() % 1 + 1) * MILLISECOND),
+            write_size_fn: Rc::new(|| (rand::random::<u64>() % 100 + 1) * MILLISECOND),
+            num_queries_fn: Rc::new(|| 10),
             read_only_ratio: 0.95,
         },
     };
@@ -179,10 +181,13 @@ fn main() {
     );
     println!("{} application retries", model.app.retry_count);
     println!(
-        "finished {} transactions, {} still in flight",
+        "finished {} transactions,  {} still in flight",
         model.app.txn_duration_stat.len(),
         model.app.pending_transactions.len()
     );
+    for (error, stat) in model.app.failed_txn_stat {
+        println!("{} transactions failed with error {:?}", stat.len(), error);
+    }
 
     println!(
         "txn duration min: {}, median: {}, mean: {}, p99: {}",
@@ -897,6 +902,8 @@ struct App {
     // start_ts => transaction.
     pending_transactions: HashMap<Time, Transaction>,
     txn_duration_stat: Histogram<Time>,
+    // duration before it fails
+    failed_txn_stat: HashMap<Error, Histogram<Time>>,
     read_staleness: Option<Time>,
     num_region: u64,
     retry_count: u64,
@@ -905,6 +912,8 @@ struct App {
     write_size_fn: Rc<dyn Fn() -> Time>,
     num_queries_fn: Rc<dyn Fn() -> u64>,
     read_only_ratio: f64,
+
+    retry: bool,
 }
 
 enum CommitPhase {
@@ -1005,6 +1014,7 @@ impl App {
             pending_transactions: HashMap::new(),
             txn_duration_stat: Histogram::<Time>::new_with_bounds(NANOSECOND, 60 * SECOND, 3)
                 .unwrap(),
+            failed_txn_stat: HashMap::new(),
             read_staleness: cfg.app_config.read_staleness,
             num_region: cfg.num_region,
             retry_count: 0,
@@ -1012,6 +1022,7 @@ impl App {
             write_size_fn: cfg.app_config.write_size_fn.clone(),
             num_queries_fn: cfg.app_config.num_queries_fn.clone(),
             read_only_ratio: cfg.app_config.read_only_ratio,
+            retry: cfg.app_config.retry,
         }
     }
 
@@ -1091,10 +1102,22 @@ impl App {
                 }
             }
         } else {
-            // application retry immediately
-            let txn = self.pending_transactions.get(&req.start_ts).unwrap();
-            self.retry_count += 1;
-            self.issue_request(txn.zone, req);
+            if self.retry {
+                // application retry immediately
+                let txn = self.pending_transactions.get(&req.start_ts).unwrap();
+                self.retry_count += 1;
+                self.issue_request(txn.zone, req);
+            } else {
+                // application doesn't retry
+                let txn = self.pending_transactions.remove(&req.start_ts).unwrap();
+                self.failed_txn_stat
+                    .entry(error.unwrap())
+                    .or_insert_with(|| {
+                        Histogram::<Time>::new_with_bounds(1, 60 * SECOND, 3).unwrap()
+                    })
+                    .record(now() - txn.start_ts)
+                    .unwrap();
+            }
         }
     }
 
