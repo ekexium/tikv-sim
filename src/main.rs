@@ -3,6 +3,7 @@ use lazy_static::lazy_static;
 use std::cell::RefCell;
 use std::cmp::{max, min, Ordering};
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::fmt::{Display, Formatter};
 use std::rc::Rc;
 use std::sync::atomic;
 use std::sync::atomic::AtomicU64;
@@ -86,6 +87,7 @@ struct Config {
     num_replica: usize,
     num_region: u64,
     max_time: Time,
+    metrics_interval: Time,
     server_config: ServerConfig,
     app_config: AppConfig,
 }
@@ -106,17 +108,19 @@ struct AppConfig {
     txn_rate: f64,
     read_staleness: Option<Time>,
     read_size_fn: Rc<dyn Fn() -> Time>,
-    write_size_fn: Rc<dyn Fn() -> Time>,
+    prewrite_size_fn: Rc<dyn Fn() -> Time>,
+    commit_size_fn: Rc<dyn Fn() -> Time>,
     num_queries_fn: Rc<dyn Fn() -> u64>,
     read_only_ratio: f64,
 }
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let events: Rc<RefCell<EventHeap>> = Rc::new(RefCell::new(EventHeap::new()));
     let config = Config {
         num_replica: 3,
         num_region: 100,
         max_time: 60 * SECOND,
+        metrics_interval: SECOND,
         server_config: ServerConfig {
             num_read_workers: 10,
             num_write_workers: 10,
@@ -126,18 +130,21 @@ fn main() {
         },
         app_config: AppConfig {
             retry: false,
-            txn_rate: 6000.0,
+            txn_rate: 5000.0,
             read_staleness: Some(10 * SECOND),
             read_size_fn: Rc::new(|| (rand::random::<u64>() % 1 + 1) * MILLISECOND),
-            write_size_fn: Rc::new(|| (rand::random::<u64>() % 100 + 1) * MILLISECOND),
+            prewrite_size_fn: Rc::new(|| (rand::random::<u64>() % 30 + 1) * MILLISECOND),
+            commit_size_fn: Rc::new(|| (rand::random::<u64>() % 20 + 1) * MILLISECOND),
             num_queries_fn: Rc::new(|| 10),
-            read_only_ratio: 0.95,
+            read_only_ratio: 0.05,
         },
     };
+    assert_eq!(config.metrics_interval, SECOND, "why bother");
 
     let mut model = Model {
-        num_replica: config.num_replica,
         events: events.clone(),
+        num_replica: config.num_replica,
+        metrics_interval: config.metrics_interval,
         servers: vec![
             Server::new(Zone::AZ1, events.clone(), &config),
             Server::new(Zone::AZ2, events.clone(), &config),
@@ -149,19 +156,28 @@ fn main() {
             Client::new(Zone::AZ3, events.clone()),
         ],
         app: App::new(events.clone(), &config),
+        app_ok_transaction_durations: vec![],
+        app_fail_transaction_durations: vec![],
+        kv_ok_durations: Default::default(),
+        kv_error_durations: Default::default(),
+        server_max_resolved_ts_gap: vec![],
+        server_read_queue_length: Default::default(),
+        server_write_queue_length: Default::default(),
+        advance_resolved_ts_failure: vec![],
     };
     model.init(&config);
 
     loop {
         let mut events_mut = events.borrow_mut();
-        if events_mut
-            .peek()
-            .map(|e| e.trigger_time > config.max_time)
-            .unwrap_or(true)
-        {
-            break;
-        }
-        let event = events_mut.pop().unwrap();
+        let event = match events_mut.pop() {
+            None => break,
+            Some(e) => {
+                if e.trigger_time > config.max_time {
+                    break;
+                }
+                e
+            }
+        };
         // time cannot go back
         assert!(now() <= event.trigger_time);
         CURRENT_TIME.store(event.trigger_time, atomic::Ordering::SeqCst);
@@ -169,105 +185,618 @@ fn main() {
         (event.f)(&mut model);
     }
 
-    println!(
-        "simulation time: {}, generated {} tasks, finished {} requests(including retry)",
-        now().pretty_print(),
-        TASK_COUNTER.load(atomic::Ordering::SeqCst),
-        model
-            .clients
+    draw_metrics(&model, &config)?;
+    Ok(())
+}
+
+fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    use plotters::prelude::*;
+    let num_graphs = 11;
+    let root = SVGBackend::new(
+        "0.svg",
+        ((cfg.max_time / SECOND * 15 + 200) as u32, num_graphs * 400),
+    )
+    .into_drawing_area();
+    let children_area = root.split_evenly((num_graphs as usize, 1));
+    let xs = (0..model.app_ok_transaction_durations.len()).map(|i| i as f32);
+    let font = ("Jetbrains Mono", 15).into_font();
+    // elegant low-saturation colors
+    let colors = [
+        RGBColor(0x1f, 0x77, 0xb4),
+        RGBColor(0xff, 0x7f, 0x0e),
+        RGBColor(0x2c, 0xa0, 0x2c),
+        RGBColor(0xd6, 0x27, 0x28),
+        RGBColor(0x94, 0x67, 0xbd),
+        RGBColor(0x8c, 0x56, 0x4b),
+        RGBColor(0xe3, 0x77, 0xc2),
+        RGBColor(0x7f, 0x7f, 0x7f),
+        RGBColor(0xbc, 0xbd, 0x22),
+        RGBColor(0x17, 0xbe, 0xcf),
+    ];
+
+    let mut chart_id = 0;
+    // app_ok_tps
+    {
+        let txn_tps = model.app_ok_transaction_durations.iter().map(|b| b.len());
+        let mut chart = ChartBuilder::on(&children_area[chart_id])
+            .caption("successful TPS", font.clone())
+            .margin(30)
+            .x_label_area_size(30)
+            .y_label_area_size(30)
+            .build_cartesian_2d(
+                0f32..model.app_ok_transaction_durations.len() as f32,
+                0f32..txn_tps.clone().max().unwrap() as f32 * 1.2,
+            )?;
+
+        chart.configure_mesh().disable_mesh().draw()?;
+        chart.draw_series(LineSeries::new(
+            xs.clone().zip(txn_tps.map(|x| x as f32)),
+            &colors[0],
+        ))?;
+    }
+
+    // app_ok_txn_latency
+    {
+        chart_id += 1;
+        let (y_unit, y_label) = (MILLISECOND, "ms");
+        let mut chart = ChartBuilder::on(&children_area[chart_id])
+            .caption("successful txn latency", font.clone())
+            .margin(30)
+            .x_label_area_size(30)
+            .y_label_area_size(30)
+            .build_cartesian_2d(
+                0f32..model.app_ok_transaction_durations.len() as f32,
+                0f32..(model
+                    .app_ok_transaction_durations
+                    .iter()
+                    .map(|x| x.max())
+                    .max()
+                    .unwrap()
+                    / y_unit) as f32
+                    * 1.2,
+            )?;
+
+        chart
+            .configure_mesh()
+            .disable_mesh()
+            .y_label_formatter(&|x| format!("{:.1}{}", x, y_label))
+            .draw()?;
+        // mean latency
+        chart
+            .draw_series(LineSeries::new(
+                xs.clone().zip(
+                    model
+                        .app_ok_transaction_durations
+                        .iter()
+                        .map(|x| (x.mean() / y_unit as f64) as f32),
+                ),
+                &colors[0],
+            ))?
+            .label("mean")
+            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &colors[0]));
+        // p99 latency
+        chart
+            .draw_series(LineSeries::new(
+                xs.clone().zip(
+                    model
+                        .app_ok_transaction_durations
+                        .iter()
+                        .map(|x| (x.value_at_quantile(0.99) / y_unit) as f32),
+                ),
+                &colors[1],
+            ))?
+            .label("p99")
+            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &colors[1]));
+        // legend
+        chart
+            .configure_series_labels()
+            .position(SeriesLabelPosition::UpperLeft)
+            .background_style(&WHITE.mix(0.5))
+            .draw()?;
+    }
+
+    // app error TPS
+    {
+        chart_id += 1;
+        let mut chart = ChartBuilder::on(&children_area[chart_id])
+            .caption("app error TPS", font.clone())
+            .margin(30)
+            .x_label_area_size(30)
+            .y_label_area_size(30)
+            .build_cartesian_2d(
+                0f32..model.app_fail_transaction_durations.len() as f32,
+                0f32..model
+                    .app_fail_transaction_durations
+                    .iter()
+                    .map(|x| x.values().map(|x| x.len()).max().unwrap_or(0))
+                    .max()
+                    .unwrap_or(0) as f32
+                    * 1.2,
+            )?;
+
+        chart.configure_mesh().disable_mesh().draw()?;
+        let errors = model
+            .app_fail_transaction_durations
             .iter()
-            .map(|c| c.latency_stat.len())
-            .sum::<u64>()
-    );
-    println!("{} application retries", model.app.retry_count);
-    println!(
-        "finished {} transactions,  {} still in flight",
-        model.app.txn_duration_stat.len(),
-        model.app.pending_transactions.len()
-    );
-    for (error, stat) in model.app.failed_txn_stat {
-        println!("{} transactions failed with error {:?}", stat.len(), error);
-    }
+            .map(|x| x.keys())
+            .flatten()
+            .collect::<HashSet<_>>();
 
-    println!(
-        "txn duration min: {}, median: {}, mean: {}, p99: {}",
-        model.app.txn_duration_stat.min().pretty_print(),
-        model
-            .app
-            .txn_duration_stat
-            .value_at_quantile(0.5)
-            .pretty_print(),
-        (model.app.txn_duration_stat.mean() as u64).pretty_print(),
-        model
-            .app
-            .txn_duration_stat
-            .value_at_quantile(0.99)
-            .pretty_print()
-    );
-
-    for client in model.clients {
-        println!(
-            "\nclient {:?} mean: {}, p99: {}",
-            client.id,
-            (client.latency_stat.mean() as u64).pretty_print(),
-            (client.latency_stat.value_at_quantile(0.99)).pretty_print(),
-        );
-        for (success, stat) in client.success_latency_stat {
-            println!(
-                "success {:?} {:?}, mean: {}, p99: {}",
-                success,
-                stat.len(),
-                (stat.mean() as u64).pretty_print(),
-                (stat.value_at_quantile(0.99)).pretty_print(),
-            );
+        for (i, error) in errors.iter().enumerate() {
+            chart
+                .draw_series(LineSeries::new(
+                    xs.clone().zip(
+                        model
+                            .app_fail_transaction_durations
+                            .iter()
+                            .map(|x| x.get(error).map(|x| x.len()).unwrap_or(0) as f32),
+                    ),
+                    colors[i],
+                ))?
+                .label(error.to_string())
+                .legend(move |(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], colors[i]));
         }
-        for (error, stat) in client.error_latency_stat {
-            println!(
-                "error {:?} {:?}, min: {}, median: {}, mean: {}, p99: {}",
-                error,
-                stat.len(),
-                stat.min().pretty_print(),
-                stat.value_at_quantile(0.5).pretty_print(),
-                (stat.mean() as u64).pretty_print(),
-                (stat.value_at_quantile(0.99)).pretty_print(),
-            );
-        }
+        chart
+            .configure_series_labels()
+            .position(SeriesLabelPosition::UpperLeft)
+            .background_style(&WHITE.mix(0.5))
+            .draw()?;
     }
 
-    for server in model.servers {
-        println!("\nserver {}", server.server_id);
-        println!(
-            "handled {} read requests, {} in queue, {} timeouts, schedule wait mean: {}, p99: {}",
-            server.read_schedule_wait_stat.len(),
-            server.read_task_queue.len(),
-            server.error_count,
-            (server.read_schedule_wait_stat.mean() as u64).pretty_print(),
-            (server.read_schedule_wait_stat.value_at_quantile(0.99)).pretty_print(),
-        );
-        println!(
-            "handled {} write requests, {} in queue, schedule wait mean: {}, p99: {}",
-            server.write_schedule_wait_stat.len(),
-            server.write_task_queue.len(),
-            (server.write_schedule_wait_stat.mean() as u64).pretty_print(),
-            (server.write_schedule_wait_stat.value_at_quantile(0.99)).pretty_print(),
-        );
-        println!(
-            "advance of resolved-ts failed {} times",
-            server
-                .peers
-                .values()
-                .map(|p| p.fail_advance_resolved_ts_stat)
-                .sum::<u64>()
-        )
+    // KV QPS
+    {
+        chart_id += 1;
+        let mut chart = ChartBuilder::on(&children_area[chart_id])
+            .caption("kv ok QPS", font.clone())
+            .margin(30)
+            .x_label_area_size(30)
+            .y_label_area_size(30)
+            .build_cartesian_2d(
+                0f32..model.kv_ok_durations.len() as f32,
+                (0f32..model
+                    .kv_ok_durations
+                    .iter()
+                    .map(|x| x.values().map(|x| x.len()).sum::<u64>())
+                    .max()
+                    .unwrap() as f32
+                    * 3.0)
+                    .log_scale()
+                    .base(2.0),
+            )?;
+
+        chart.configure_mesh().disable_x_mesh().draw()?;
+        let errors = model
+            .kv_ok_durations
+            .iter()
+            .map(|x| x.keys())
+            .flatten()
+            .collect::<HashSet<_>>();
+
+        for (i, error) in errors.iter().enumerate() {
+            chart
+                .draw_series(LineSeries::new(
+                    xs.clone().zip(
+                        model
+                            .kv_ok_durations
+                            .iter()
+                            .map(|x| x.get(error).map(|x| x.len()).unwrap_or(0) as f32),
+                    ),
+                    colors[i],
+                ))?
+                .label(error.to_string())
+                .legend(move |(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], colors[i]));
+        }
+        chart
+            .configure_series_labels()
+            .position(SeriesLabelPosition::UpperLeft)
+            .background_style(&WHITE.mix(0.5))
+            .draw()?;
     }
+
+    // kv error rates
+    {
+        chart_id += 1;
+        let mut chart = ChartBuilder::on(&children_area[chart_id])
+            .caption("kv error rates", font.clone())
+            .margin(30)
+            .x_label_area_size(30)
+            .y_label_area_size(30)
+            .build_cartesian_2d(
+                0f32..model.kv_error_durations.len() as f32,
+                0f32..model
+                    .kv_error_durations
+                    .iter()
+                    .map(|x| x.values().map(|x| x.len()).sum::<u64>())
+                    .max()
+                    .unwrap() as f32
+                    * 1.2,
+            )?;
+
+        chart.configure_mesh().disable_mesh().draw()?;
+        let errors = model
+            .kv_error_durations
+            .iter()
+            .map(|x| x.keys())
+            .flatten()
+            .collect::<HashSet<_>>();
+
+        for (i, error) in errors.iter().enumerate() {
+            chart
+                .draw_series(LineSeries::new(
+                    xs.clone().zip(
+                        model
+                            .kv_error_durations
+                            .iter()
+                            .map(|x| x.get(error).map(|x| x.len()).unwrap_or(0) as f32),
+                    ),
+                    colors[i],
+                ))?
+                .label(error.to_string())
+                .legend(move |(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], colors[i]));
+        }
+        chart
+            .configure_series_labels()
+            .position(SeriesLabelPosition::UpperLeft)
+            .background_style(&WHITE.mix(0.5))
+            .draw()?;
+    }
+
+    // KV OK latency
+    {
+        chart_id += 1;
+        let (y_unit, y_label) = (MILLISECOND, "ms");
+        let mut chart = ChartBuilder::on(&children_area[chart_id])
+            .caption("kv ok latency", font.clone())
+            .margin(30)
+            .x_label_area_size(30)
+            .y_label_area_size(30)
+            .build_cartesian_2d(
+                0f32..model.kv_ok_durations.len() as f32,
+                (0f32..(model
+                    .kv_ok_durations
+                    .iter()
+                    .map(|x| x.values().map(|x| x.max()).max().unwrap_or(0))
+                    .max()
+                    .unwrap()
+                    / y_unit) as f32
+                    * 3.0)
+                    .log_scale()
+                    .base(2.0),
+            )?;
+
+        chart
+            .configure_mesh()
+            .disable_x_mesh()
+            .y_label_formatter(&|x| format!("{:.1}{}", x, y_label))
+            .draw()?;
+
+        let req_types = model
+            .kv_ok_durations
+            .iter()
+            .map(|x| x.keys())
+            .flatten()
+            .collect::<HashSet<_>>();
+
+        // mean latency
+        for (i, req_type) in req_types.iter().enumerate() {
+            chart
+                .draw_series(LineSeries::new(
+                    xs.clone().zip(model.kv_ok_durations.iter().map(|x| {
+                        x.get(req_type)
+                            .map(|x| (x.mean() / y_unit as f64) as f32)
+                            .unwrap_or(0.0)
+                    })),
+                    colors[i],
+                ))?
+                .label(req_type.to_string() + "-mean")
+                .legend(move |(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], colors[i]));
+        }
+
+        // p99 latency
+        for (i, req_type) in req_types.iter().enumerate() {
+            chart
+                .draw_series(PointSeries::<(f32, f32), _, Circle<_, _>, f32>::new(
+                    xs.clone().zip(model.kv_ok_durations.iter().map(|x| {
+                        x.get(req_type)
+                            .map(|x| (x.value_at_quantile(0.99) / y_unit) as f32)
+                            .unwrap_or(0.0)
+                    })),
+                    3f32,
+                    &colors[i],
+                ))?
+                .label(req_type.to_string() + "-p99")
+                .legend(move |(x, y)| Circle::new((x, y), 3f32, colors[i]));
+        }
+
+        // legend
+        chart
+            .configure_series_labels()
+            .position(SeriesLabelPosition::UpperLeft)
+            .background_style(&WHITE.mix(0.5))
+            .draw()?;
+    }
+
+    // KV error latency
+    {
+        chart_id += 1;
+        let (y_unit, y_label) = (MILLISECOND, "ms");
+        let mut chart = ChartBuilder::on(&children_area[chart_id])
+            .caption("kv error latency", font.clone())
+            .margin(30)
+            .x_label_area_size(30)
+            .y_label_area_size(30)
+            .build_cartesian_2d(
+                0f32..model.kv_error_durations.len() as f32,
+                0f32..(model
+                    .kv_error_durations
+                    .iter()
+                    .map(|x| x.values().map(|x| x.max()).max().unwrap_or(0))
+                    .max()
+                    .unwrap()
+                    / y_unit) as f32
+                    * 1.2,
+            )?;
+
+        let errors = model
+            .kv_error_durations
+            .iter()
+            .map(|x| x.keys())
+            .flatten()
+            .collect::<HashSet<_>>();
+
+        chart
+            .configure_mesh()
+            .disable_mesh()
+            .y_label_formatter(&|x| format!("{:.1}{}", x, y_label))
+            .draw()?;
+
+        // mean latency
+        for (i, error) in errors.iter().enumerate() {
+            chart
+                .draw_series(LineSeries::new(
+                    xs.clone().zip(model.kv_error_durations.iter().map(|x| {
+                        x.get(error)
+                            .map(|x| (x.mean() / y_unit as f64) as f32)
+                            .unwrap_or(0.0)
+                    })),
+                    colors[i],
+                ))?
+                .label(error.to_string() + "-mean")
+                .legend(move |(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], colors[i]));
+        }
+
+        // p99 latency
+        for (i, error) in errors.iter().enumerate() {
+            chart
+                .draw_series(PointSeries::<(f32, f32), _, Circle<_, _>, f32>::new(
+                    xs.clone().zip(model.kv_error_durations.iter().map(|x| {
+                        x.get(error)
+                            .map(|x| (x.value_at_quantile(0.99) / y_unit) as f32)
+                            .unwrap_or(0.0)
+                    })),
+                    3f32,
+                    &colors[i],
+                ))?
+                .label(error.to_string() + "-p99")
+                .legend(move |(x, y)| Circle::new((x, y), 3f32, colors[i]));
+        }
+
+        // legend
+        chart
+            .configure_series_labels()
+            .position(SeriesLabelPosition::UpperLeft)
+            .background_style(&WHITE.mix(0.5))
+            .draw()?;
+    }
+
+    // read queue length
+    {
+        chart_id += 1;
+        let mut chart = ChartBuilder::on(&children_area[chart_id])
+            .caption("read queue length", font.clone())
+            .margin(30)
+            .x_label_area_size(30)
+            .y_label_area_size(30)
+            .build_cartesian_2d(
+                0f32..model.server_read_queue_length.len() as f32,
+                0f32..(model
+                    .server_read_queue_length
+                    .iter()
+                    .map(|x| x.values().map(|x| *x).max().unwrap_or(0))
+                    .max()
+                    .unwrap() as f32
+                    * 1.2),
+            )?;
+
+        chart.configure_mesh().disable_mesh().draw()?;
+        let server_ids = model
+            .server_read_queue_length
+            .iter()
+            .map(|x| x.keys())
+            .flatten()
+            .collect::<HashSet<_>>();
+
+        for (i, server_id) in server_ids.iter().enumerate() {
+            chart
+                .draw_series(LineSeries::new(
+                    xs.clone().zip(
+                        model
+                            .server_read_queue_length
+                            .iter()
+                            .map(|x| x.get(server_id).map(|x| *x).unwrap_or(0) as f32),
+                    ),
+                    colors[i],
+                ))?
+                .label(format!("server-{}", server_id))
+                .legend(move |(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], colors[i]));
+        }
+        chart
+            .configure_series_labels()
+            .position(SeriesLabelPosition::UpperLeft)
+            .background_style(&WHITE.mix(0.5))
+            .draw()?;
+    }
+
+    // write queue length
+    {
+        chart_id += 1;
+        let mut chart = ChartBuilder::on(&children_area[chart_id])
+            .caption("write queue length", font.clone())
+            .margin(30)
+            .x_label_area_size(30)
+            .y_label_area_size(30)
+            .build_cartesian_2d(
+                0f32..model.server_write_queue_length.len() as f32,
+                0f32..(model
+                    .server_write_queue_length
+                    .iter()
+                    .map(|x| x.values().map(|x| *x).max().unwrap_or(0))
+                    .max()
+                    .unwrap() as f32
+                    * 1.2),
+            )?;
+
+        chart.configure_mesh().disable_mesh().draw()?;
+        let server_ids = model
+            .server_write_queue_length
+            .iter()
+            .map(|x| x.keys())
+            .flatten()
+            .collect::<HashSet<_>>();
+
+        for (i, server_id) in server_ids.iter().enumerate() {
+            chart
+                .draw_series(LineSeries::new(
+                    xs.clone().zip(
+                        model
+                            .server_write_queue_length
+                            .iter()
+                            .map(|x| x.get(server_id).map(|x| *x).unwrap_or(0) as f32),
+                    ),
+                    colors[i],
+                ))?
+                .label(format!("server-{}", server_id))
+                .legend(move |(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], colors[i]));
+        }
+        chart
+            .configure_series_labels()
+            .position(SeriesLabelPosition::UpperLeft)
+            .background_style(&WHITE.mix(0.5))
+            .draw()?;
+    }
+
+    // server_max_resolved_ts_gap
+    {
+        chart_id += 1;
+        let mut chart_max_resolved_ts_gap = ChartBuilder::on(&children_area[chart_id])
+            .caption("max resolved ts gap", font.clone())
+            .margin(30)
+            .x_label_area_size(30)
+            .y_label_area_size(30)
+            .build_cartesian_2d(
+                0f32..model.server_max_resolved_ts_gap.len() as f32,
+                0f32..(*model
+                    .server_max_resolved_ts_gap
+                    .clone()
+                    .iter()
+                    .max()
+                    .unwrap_or(&0)
+                    / SECOND) as f32
+                    * 1.2,
+            )?;
+
+        chart_max_resolved_ts_gap
+            .configure_mesh()
+            .disable_mesh()
+            .draw()?;
+        chart_max_resolved_ts_gap.draw_series(LineSeries::new(
+            xs.clone().zip(
+                model
+                    .server_max_resolved_ts_gap
+                    .clone()
+                    .iter()
+                    .map(|x| (*x / SECOND) as f32),
+            ),
+            &colors[0],
+        ))?;
+    }
+
+    // advance_ts_fail_count
+    {
+        chart_id += 1;
+        let mut chart = ChartBuilder::on(&children_area[chart_id])
+            .caption("advance resolved ts failure count", font.clone())
+            .margin(30)
+            .x_label_area_size(30)
+            .y_label_area_size(30)
+            .build_cartesian_2d(
+                0f32..model.advance_resolved_ts_failure.len() as f32,
+                0f32..(*model
+                    .advance_resolved_ts_failure
+                    .iter()
+                    .map(|x| x.values().max().unwrap_or(&0))
+                    .max()
+                    .unwrap_or(&0) as f32
+                    * 1.2),
+            )?;
+
+        chart.configure_mesh().disable_mesh().draw()?;
+        let server_ids = model
+            .advance_resolved_ts_failure
+            .iter()
+            .map(|x| x.keys())
+            .flatten()
+            .collect::<HashSet<_>>();
+
+        for (i, server_id) in server_ids.iter().enumerate() {
+            chart
+                .draw_series(LineSeries::new(
+                    xs.clone().zip(
+                        model
+                            .advance_resolved_ts_failure
+                            .iter()
+                            .map(|x| x.get(server_id).map(|x| *x).unwrap_or(0) as f32),
+                    ),
+                    colors[i],
+                ))?
+                .label(format!("server-{}", server_id))
+                .legend(move |(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], colors[i]));
+        }
+        chart
+            .configure_series_labels()
+            .position(SeriesLabelPosition::UpperLeft)
+            .background_style(&WHITE.mix(0.5))
+            .draw()?;
+    }
+
+    root.present()?;
+    Ok(())
 }
 
 struct Model {
+    // model
     events: Events,
     servers: Vec<Server>,
     clients: Vec<Client>,
-    num_replica: usize,
     app: App,
+
+    // config
+    num_replica: usize,
+    metrics_interval: Time,
+
+    // metrics
+    app_ok_transaction_durations: Vec<Histogram<Time>>,
+    app_fail_transaction_durations: Vec<HashMap<Error, Histogram<Time>>>,
+    kv_ok_durations: Vec<HashMap<EventType, Histogram<Time>>>,
+    kv_error_durations: Vec<HashMap<Error, Histogram<Time>>>,
+    // gauge
+    server_max_resolved_ts_gap: Vec<Time>,
+    // gauge, server_id -> length
+    server_read_queue_length: Vec<HashMap<u64, u64>>,
+    // gauge, server_id -> length
+    server_write_queue_length: Vec<HashMap<u64, u64>>,
+    // server id -> count
+    advance_resolved_ts_failure: Vec<HashMap<u64, u64>>,
 }
 
 impl Model {
@@ -314,6 +843,7 @@ impl Model {
 
         // start
         self.app.gen_txn();
+        self.collect_metrics();
     }
 
     fn find_leader_by_id(servers: &mut [Server], region_id: u64) -> &mut Peer {
@@ -355,6 +885,113 @@ impl Model {
 
     fn find_client_by_zone(&mut self, zone: Zone) -> &mut Client {
         self.clients.iter_mut().find(|c| c.zone == zone).unwrap()
+    }
+
+    fn collect_metrics(&mut self) {
+        {
+            self.app_ok_transaction_durations
+                .push(self.app.txn_duration_stat.clone());
+            self.app.txn_duration_stat.reset();
+        }
+
+        self.server_max_resolved_ts_gap.push(
+            self.servers
+                .iter()
+                .map(|s| {
+                    s.peers
+                        .values()
+                        .map(|p| {
+                            if p.role == Role::Leader {
+                                now() - p.resolved_ts
+                            } else {
+                                0
+                            }
+                        })
+                        .max()
+                        .unwrap_or(0)
+                })
+                .max()
+                .unwrap_or(0),
+        );
+
+        {
+            let mut map = HashMap::new();
+            for (error, stat) in &mut self.app.failed_txn_stat {
+                map.insert(error.clone(), stat.clone());
+                stat.reset();
+            }
+            self.app_fail_transaction_durations.push(map);
+        }
+
+        {
+            let mut map = HashMap::new();
+            for client in &mut self.clients {
+                for (req_type, stat) in &mut client.success_latency_stat {
+                    map.entry(*req_type)
+                        .or_insert_with(|| {
+                            Histogram::<Time>::new_with_bounds(NANOSECOND, 60 * SECOND, 3).unwrap()
+                        })
+                        .add(stat.clone())
+                        .unwrap();
+                    stat.reset()
+                }
+            }
+            self.kv_ok_durations.push(map);
+        }
+
+        {
+            let mut map: HashMap<Error, Histogram<Time>> = HashMap::new();
+            for client in &mut self.clients {
+                for (error, stat) in &mut client.error_latency_stat {
+                    map.entry(*error)
+                        .or_insert_with(|| {
+                            Histogram::<Time>::new_with_bounds(NANOSECOND, 60 * SECOND, 3).unwrap()
+                        })
+                        .add(stat.clone())
+                        .unwrap();
+                    stat.reset();
+                }
+            }
+            self.kv_error_durations.push(map);
+        }
+
+        {
+            let mut map = HashMap::new();
+            for server in &self.servers {
+                map.insert(server.server_id, server.read_task_queue.len() as u64);
+            }
+            self.server_read_queue_length.push(map);
+        }
+
+        {
+            let mut map = HashMap::new();
+            for server in &self.servers {
+                map.insert(server.server_id, server.write_task_queue.len() as u64);
+            }
+            self.server_write_queue_length.push(map);
+        }
+
+        {
+            let mut map = HashMap::new();
+            for server in &mut self.servers {
+                for (_, peer) in &mut server.peers {
+                    if peer.role == Role::Leader {
+                        *map.entry(server.server_id).or_insert(0) +=
+                            peer.fail_advance_resolved_ts_stat;
+                        peer.fail_advance_resolved_ts_stat = 0;
+                    }
+                }
+            }
+            self.advance_resolved_ts_failure.push(map);
+        }
+
+        self.events.borrow_mut().push(Event::new(
+            now() + self.metrics_interval,
+            EventType::CollectMetrics,
+            Box::new(move |model: &mut Model| {
+                model.collect_metrics();
+            }),
+        ));
     }
 }
 
@@ -901,19 +1538,21 @@ struct App {
     rate_exp_dist: Exp<f64>,
     // start_ts => transaction.
     pending_transactions: HashMap<Time, Transaction>,
-    txn_duration_stat: Histogram<Time>,
-    // duration before it fails
-    failed_txn_stat: HashMap<Error, Histogram<Time>>,
     read_staleness: Option<Time>,
     num_region: u64,
     retry_count: u64,
 
+    // configs
     read_size_fn: Rc<dyn Fn() -> Time>,
-    write_size_fn: Rc<dyn Fn() -> Time>,
+    prewrite_size_fn: Rc<dyn Fn() -> Time>,
+    commit_size_fn: Rc<dyn Fn() -> Time>,
     num_queries_fn: Rc<dyn Fn() -> u64>,
     read_only_ratio: f64,
-
     retry: bool,
+
+    // metrics
+    txn_duration_stat: Histogram<Time>,
+    failed_txn_stat: HashMap<Error, Histogram<Time>>,
 }
 
 enum CommitPhase {
@@ -948,7 +1587,8 @@ impl Transaction {
         read_staleness: Option<Time>,
         num_region: u64,
         read_size_fn: Rc<dyn Fn() -> Time>,
-        write_size_fn: Rc<dyn Fn() -> Time>,
+        prewrite_size_fn: Rc<dyn Fn() -> Time>,
+        commit_size_fn: Rc<dyn Fn() -> Time>,
     ) -> Self {
         assert!(read_staleness.is_none() || read_only);
         // we assume at least 1 query.
@@ -973,7 +1613,7 @@ impl Transaction {
                 start_ts,
                 None,
                 EventType::PrewriteRequest,
-                write_size_fn(),
+                prewrite_size_fn(),
                 u64::MAX,
                 write_region,
             ));
@@ -981,7 +1621,7 @@ impl Transaction {
                 start_ts,
                 None,
                 EventType::CommitRequest,
-                write_size_fn(),
+                commit_size_fn(),
                 u64::MAX,
                 write_region,
             ));
@@ -1019,7 +1659,8 @@ impl App {
             num_region: cfg.num_region,
             retry_count: 0,
             read_size_fn: cfg.app_config.read_size_fn.clone(),
-            write_size_fn: cfg.app_config.write_size_fn.clone(),
+            prewrite_size_fn: cfg.app_config.prewrite_size_fn.clone(),
+            commit_size_fn: cfg.app_config.commit_size_fn.clone(),
             num_queries_fn: cfg.app_config.num_queries_fn.clone(),
             read_only_ratio: cfg.app_config.read_only_ratio,
             retry: cfg.app_config.retry,
@@ -1035,7 +1676,8 @@ impl App {
             if read_only { self.read_staleness } else { None },
             self.num_region,
             self.read_size_fn.clone(),
-            self.write_size_fn.clone(),
+            self.prewrite_size_fn.clone(),
+            self.commit_size_fn.clone(),
         );
         let zone = txn.zone;
         let req = txn.remaining_queries.pop_front().unwrap();
@@ -1178,10 +1820,6 @@ impl EventHeap {
         }
     }
 
-    fn peek(&self) -> Option<&Event> {
-        self.events.peek()
-    }
-
     fn pop(&mut self) -> Option<Event> {
         self.events.pop()
     }
@@ -1249,6 +1887,26 @@ enum EventType {
     // client to app
     AppResp,
     AppGen,
+    CollectMetrics,
+}
+
+impl Display for EventType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EventType::HandleRead => write!(f, "HandleRead"),
+            EventType::HandleWrite => write!(f, "HandleWrite"),
+            EventType::ResolvedTsUpdate => write!(f, "ResolvedTsUpdate"),
+            EventType::BroadcastSafeTs => write!(f, "BroadcastSafeTs"),
+            EventType::ReadRequest => write!(f, "ReadRequest"),
+            EventType::ReadRequestTimeout => write!(f, "ReadRequestTimeout"),
+            EventType::PrewriteRequest => write!(f, "PrewriteRequest"),
+            EventType::CommitRequest => write!(f, "CommitRequest"),
+            EventType::Response => write!(f, "Response"),
+            EventType::AppResp => write!(f, "AppResp"),
+            EventType::AppGen => write!(f, "AppGen"),
+            EventType::CollectMetrics => write!(f, "CollectMetrics"),
+        }
+    }
 }
 
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
@@ -1258,4 +1916,14 @@ enum Error {
     // all servers are unavailable
     RegionUnavailable,
     DataIsNotReady,
+}
+
+impl Display for Error {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::ReadTimeout => write!(f, "ReadTimeout"),
+            Error::RegionUnavailable => write!(f, "RegionUnavailable"),
+            Error::DataIsNotReady => write!(f, "DataIsNotReady"),
+        }
+    }
 }
