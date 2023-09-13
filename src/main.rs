@@ -133,7 +133,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         num_replica: 3,
         num_region: 10000,
         num_servers: 3,
-        max_time: 600 * SECOND,
+        max_time: 1200 * SECOND,
         metrics_interval: SECOND,
         server_config: ServerConfig {
             enable_async_commit: true,
@@ -144,12 +144,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             broadcast_interval: 5 * SECOND,
         },
         client_config: ClientConfig {
-            max_execution_time: 20 * SECOND,
+            max_execution_time: 10 * SECOND,
         },
         app_config: AppConfig {
             retry: false,
-            txn_rate: 3200.0,
-            read_staleness: Some(11 * SECOND),
+            txn_rate: 3400.0,
+            read_staleness: Some(12 * SECOND),
             read_size_fn: Rc::new(|| (rand::random::<u64>() % 5 + 1) * MILLISECOND),
             prewrite_size_fn: Rc::new(|| (rand::random::<u64>() % 30 + 1) * MILLISECOND),
             commit_size_fn: Rc::new(|| (rand::random::<u64>() % 20 + 1) * MILLISECOND),
@@ -191,7 +191,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         server_error_count: vec![],
     };
     model.init(&config);
-    model.inject();
+    model.inject_app_retry();
 
     let bar = ProgressBar::new(config.max_time / SECOND);
     loop {
@@ -1168,7 +1168,8 @@ struct Model {
 }
 
 impl Model {
-    fn inject(&mut self) {
+    #[allow(unused)]
+    fn inject_crashed_client(&mut self) {
         let region_id = 1;
         println!(
             "inject lock in region {} in server {}",
@@ -1209,6 +1210,24 @@ impl Model {
                     region_id,
                 );
                 client.on_req(req);
+            }),
+        ));
+    }
+
+    #[allow(unused)]
+    fn inject_app_retry(&mut self) {
+        self.events.borrow_mut().push(Event::new(
+            400 * SECOND,
+            EventType::Injection,
+            Box::new(move |model| {
+                model.app.retry = true;
+            }),
+        ));
+        self.events.borrow_mut().push(Event::new(
+            800 * SECOND,
+            EventType::Injection,
+            Box::new(move |model| {
+                model.app.retry = false;
             }),
         ));
     }
@@ -1338,9 +1357,7 @@ impl Model {
             for client in &mut self.clients {
                 for (req_type, stat) in &mut client.success_latency_stat {
                     map.entry(*req_type)
-                        .or_insert_with(|| {
-                            Histogram::<Time>::new_with_bounds(NANOSECOND, 60 * SECOND, 3).unwrap()
-                        })
+                        .or_insert_with(|| new_hist())
                         .add(stat.clone())
                         .unwrap();
                     stat.reset()
@@ -1354,9 +1371,7 @@ impl Model {
             for client in &mut self.clients {
                 for (error, stat) in &mut client.error_latency_stat {
                     map.entry(*error)
-                        .or_insert_with(|| {
-                            Histogram::<Time>::new_with_bounds(NANOSECOND, 60 * SECOND, 3).unwrap()
-                        })
+                        .or_insert_with(|| new_hist())
                         .add(stat.clone())
                         .unwrap();
                     stat.reset();
@@ -1638,17 +1653,11 @@ impl Server {
             read_workers: vec![None; cfg.server_config.num_read_workers],
             write_task_queue: VecDeque::new(),
             write_workers: vec![None; cfg.server_config.num_write_workers],
-            read_schedule_wait_stat: Histogram::<Time>::new_with_bounds(NANOSECOND, 60 * SECOND, 3)
-                .unwrap(),
+            read_schedule_wait_stat: new_hist(),
             concurrency_manager: Default::default(),
             read_timeout: cfg.server_config.read_timeout,
             enable_async_commit: cfg.server_config.enable_async_commit,
-            write_schedule_wait_stat: Histogram::<Time>::new_with_bounds(
-                NANOSECOND,
-                60 * SECOND,
-                3,
-            )
-            .unwrap(),
+            write_schedule_wait_stat: new_hist(),
             read_worker_time: 0,
             write_worker_time: 0,
             error_count: Default::default(),
@@ -2081,7 +2090,7 @@ impl Client {
             zone,
             events,
             pending_tasks: HashMap::new(),
-            latency_stat: Histogram::<Time>::new_with_bounds(NANOSECOND, 60 * SECOND, 3).unwrap(),
+            latency_stat: new_hist(),
             error_latency_stat: HashMap::new(),
             success_latency_stat: HashMap::new(),
             max_execution_time: cfg.client_config.max_execution_time,
@@ -2158,9 +2167,7 @@ impl Client {
                     if let Some((start_time, _)) = this.pending_tasks.remove(&req_id) {
                         this.error_latency_stat
                             .entry(Error::MaxExecutionTimeExceeded)
-                            .or_insert_with(|| {
-                                Histogram::<Time>::new_with_bounds(1, 60 * SECOND, 3).unwrap()
-                            })
+                            .or_insert_with(|| new_hist())
                             .record(now() - start_time)
                             .unwrap();
                         assert_eq!(
@@ -2215,7 +2222,7 @@ impl Client {
             ));
             self.error_latency_stat
                 .entry(e)
-                .or_insert_with(|| Histogram::<Time>::new_with_bounds(1, 60 * SECOND, 3).unwrap())
+                .or_insert_with(|| new_hist())
                 .record(now() - start_time)
                 .unwrap();
             // retry other peers
@@ -2230,7 +2237,7 @@ impl Client {
             ));
             self.success_latency_stat
                 .entry(req.req_type)
-                .or_insert_with(|| Histogram::<Time>::new_with_bounds(1, 60 * SECOND, 3).unwrap())
+                .or_insert_with(|| new_hist())
                 .record(now() - start_time)
                 .unwrap();
             // success. respond to app
@@ -2394,8 +2401,7 @@ impl App {
             rng: StdRng::from_seed(OsRng.gen()),
             rate_exp_dist: Exp::new(cfg.app_config.txn_rate).unwrap(),
             pending_transactions: HashMap::new(),
-            txn_duration_stat: Histogram::<Time>::new_with_bounds(NANOSECOND, 60 * SECOND, 3)
-                .unwrap(),
+            txn_duration_stat: new_hist(),
             failed_txn_stat: HashMap::new(),
             read_staleness: cfg.app_config.read_staleness,
             num_region: cfg.num_region,
@@ -2485,9 +2491,7 @@ impl App {
                 ));
                 self.failed_txn_stat
                     .entry(error)
-                    .or_insert_with(|| {
-                        Histogram::<Time>::new_with_bounds(1, 60 * SECOND, 3).unwrap()
-                    })
+                    .or_insert_with(|| new_hist())
                     .record(now() - txn.start_ts)
                     .unwrap();
             }
@@ -2751,4 +2755,8 @@ impl Display for Error {
             Error::MaxExecutionTimeExceeded => write!(f, "MaxExecutionTimeExceeded"),
         }
     }
+}
+
+fn new_hist() -> Histogram<Time> {
+    Histogram::<Time>::new_with_bounds(1, 60 * 60 * SECOND, 3).unwrap()
 }
