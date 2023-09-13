@@ -2,7 +2,7 @@ use hdrhistogram::Histogram;
 use indicatif::ProgressBar;
 use lazy_static::lazy_static;
 use std::cell::RefCell;
-use std::cmp::{max, min, Ordering};
+use std::cmp::{max, Ordering};
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fmt::{Display, Formatter};
 use std::hash::Hash;
@@ -91,6 +91,7 @@ fn rpc_latency(remote: bool) -> u64 {
 struct Config {
     num_replica: usize,
     num_region: u64,
+    num_servers: u64,
     max_time: Time,
     metrics_interval: Time,
     server_config: ServerConfig,
@@ -100,7 +101,7 @@ struct Config {
 
 #[derive(Clone)]
 struct ServerConfig {
-    async_commit: bool,
+    enable_async_commit: bool,
     num_read_workers: usize,
     num_write_workers: usize,
     read_timeout: Time,
@@ -131,10 +132,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config {
         num_replica: 3,
         num_region: 10000,
-        max_time: 900 * SECOND,
+        num_servers: 3,
+        max_time: 600 * SECOND,
         metrics_interval: SECOND,
         server_config: ServerConfig {
-            async_commit: true,
+            enable_async_commit: true,
             num_read_workers: 10,
             num_write_workers: 10,
             read_timeout: SECOND,
@@ -147,7 +149,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         app_config: AppConfig {
             retry: false,
             txn_rate: 3200.0,
-            read_staleness: Some(15 * SECOND),
+            read_staleness: Some(11 * SECOND),
             read_size_fn: Rc::new(|| (rand::random::<u64>() % 5 + 1) * MILLISECOND),
             prewrite_size_fn: Rc::new(|| (rand::random::<u64>() % 30 + 1) * MILLISECOND),
             commit_size_fn: Rc::new(|| (rand::random::<u64>() % 20 + 1) * MILLISECOND),
@@ -155,7 +157,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             read_only_ratio: 0.95,
         },
     };
-    // assert_eq!(config.metrics_interval, SECOND, "why bother");
+    assert_eq!(config.metrics_interval, SECOND, "why bother");
+    assert_eq!(config.num_servers, 3, "not supported yet");
 
     let mut model = Model {
         events: events.clone(),
@@ -179,7 +182,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         server_max_resolved_ts_gap: vec![],
         server_read_queue_length: Default::default(),
         server_write_queue_length: Default::default(),
-        advance_resolved_ts_failure: vec![],
+        advance_resolved_ts_failure_for_lock_cf: vec![],
+        advance_resolved_ts_failure_for_memory_lock: vec![],
         server_read_worker_busy_time: vec![],
         server_write_worker_busy_time: vec![],
         server_read_req_count: vec![],
@@ -781,20 +785,29 @@ fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::E
             .x_label_area_size(30)
             .y_label_area_size(30)
             .build_cartesian_2d(
-                0f32..model.advance_resolved_ts_failure.len() as f32,
+                0f32..model.advance_resolved_ts_failure_for_lock_cf.len() as f32,
                 0f32..(*model
-                    .advance_resolved_ts_failure
+                    .advance_resolved_ts_failure_for_lock_cf
                     .iter()
                     .map(|x| x.values().max().unwrap_or(&0))
                     .max()
                     .unwrap_or(&0) as f32
                     * 1.2)
-                    .max(1.0),
+                    .max(1.0)
+                    .max(
+                        *model
+                            .advance_resolved_ts_failure_for_memory_lock
+                            .iter()
+                            .map(|x| x.values().max().unwrap_or(&0))
+                            .max()
+                            .unwrap_or(&0) as f32
+                            * 1.2,
+                    ),
             )?;
 
         chart.configure_mesh().disable_mesh().draw()?;
         let server_ids = model
-            .advance_resolved_ts_failure
+            .advance_resolved_ts_failure_for_lock_cf
             .iter()
             .flat_map(|x| x.keys())
             .collect::<HashSet<_>>();
@@ -804,14 +817,28 @@ fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::E
                 .draw_series(LineSeries::new(
                     xs.clone().zip(
                         model
-                            .advance_resolved_ts_failure
+                            .advance_resolved_ts_failure_for_lock_cf
                             .iter()
                             .map(|x| x.get(server_id).copied().unwrap_or(0) as f32),
                     ),
                     colors[i],
                 ))?
-                .label(format!("server-{}", server_id))
+                .label(format!("server-{}-lock", server_id))
                 .legend(move |(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], colors[i]));
+
+            chart
+                .draw_series(PointSeries::<_, _, Circle<_, _>, _>::new(
+                    xs.clone().zip(
+                        model
+                            .advance_resolved_ts_failure_for_memory_lock
+                            .iter()
+                            .map(|x| x.get(server_id).copied().unwrap_or(0) as f32),
+                    ),
+                    3,
+                    colors[i + cfg.num_servers as usize],
+                ))?
+                .label(format!("server-{}-memory-lock", server_id))
+                .legend(move |(x, y)| Circle::new((x, y), 3, colors[i + cfg.num_servers as usize]));
         }
         chart
             .configure_series_labels()
@@ -1129,7 +1156,8 @@ struct Model {
     // gauge, server_id -> length
     server_write_queue_length: Vec<HashMap<u64, u64>>,
     // server id -> count
-    advance_resolved_ts_failure: Vec<HashMap<u64, u64>>,
+    advance_resolved_ts_failure_for_lock_cf: Vec<HashMap<u64, u64>>,
+    advance_resolved_ts_failure_for_memory_lock: Vec<HashMap<u64, u64>>,
     // server id -> total time
     server_read_worker_busy_time: Vec<HashMap<u64, u64>>,
     // server id -> total time
@@ -1148,9 +1176,9 @@ impl Model {
             Self::find_leader_by_id(&mut self.servers, region_id).server_id
         );
         let mut events = self.events.borrow_mut();
-        let start_ts = 300 * SECOND;
+        let start_ts = 200 * SECOND;
         events.push(Event::new(
-            300 * SECOND,
+            start_ts,
             EventType::PrewriteRequest,
             Box::new(move |model| {
                 let client = Model::find_client_by_zone(model, Zone::AZ1);
@@ -1167,7 +1195,7 @@ impl Model {
             }),
         ));
         events.push(Event::new(
-            600 * SECOND,
+            400 * SECOND,
             EventType::CommitRequest,
             Box::new(move |model| {
                 let client = Model::find_client_by_zone(model, Zone::AZ1);
@@ -1200,9 +1228,10 @@ impl Model {
                 lock_cf: HashSet::new(),
                 advance_interval: cfg.server_config.advance_interval,
                 broadcast_interval: cfg.server_config.broadcast_interval,
-                fail_advance_resolved_ts_stat: 0,
+                fail_advance_resolved_ts_lock_cf_count: 0,
+                fail_advance_resolved_ts_memory_lock_count: 0,
             };
-            leader.update_resolved_ts(self.events.clone());
+            leader.update_resolved_ts(self.events.clone(), None);
             leader.broadcast_safe_ts(self.events.clone());
             self.servers[leader_idx].peers.insert(region_id, leader);
             for follow_id in 1..=self.num_replica - 1 {
@@ -1219,7 +1248,8 @@ impl Model {
                         lock_cf: HashSet::new(),
                         advance_interval: cfg.server_config.advance_interval,
                         broadcast_interval: cfg.server_config.broadcast_interval,
-                        fail_advance_resolved_ts_stat: 0,
+                        fail_advance_resolved_ts_lock_cf_count: 0,
+                        fail_advance_resolved_ts_memory_lock_count: 0,
                     },
                 );
             }
@@ -1357,12 +1387,26 @@ impl Model {
                 for peer in &mut server.peers.values_mut() {
                     if peer.role == Role::Leader {
                         *map.entry(server.server_id).or_insert(0) +=
-                            peer.fail_advance_resolved_ts_stat;
-                        peer.fail_advance_resolved_ts_stat = 0;
+                            peer.fail_advance_resolved_ts_lock_cf_count;
+                        peer.fail_advance_resolved_ts_lock_cf_count = 0;
                     }
                 }
             }
-            self.advance_resolved_ts_failure.push(map);
+            self.advance_resolved_ts_failure_for_lock_cf.push(map);
+        }
+
+        {
+            let mut map = HashMap::new();
+            for server in &mut self.servers {
+                for peer in &mut server.peers.values_mut() {
+                    if peer.role == Role::Leader {
+                        *map.entry(server.server_id).or_insert(0) +=
+                            peer.fail_advance_resolved_ts_memory_lock_count;
+                        peer.fail_advance_resolved_ts_memory_lock_count = 0;
+                    }
+                }
+            }
+            self.advance_resolved_ts_failure_for_memory_lock.push(map);
         }
 
         {
@@ -1480,19 +1524,31 @@ struct Peer {
     safe_ts: u64,
     advance_interval: Time,
     broadcast_interval: Time,
-    fail_advance_resolved_ts_stat: u64,
+    fail_advance_resolved_ts_lock_cf_count: u64,
+    fail_advance_resolved_ts_memory_lock_count: u64,
 }
 
 impl Peer {
-    fn update_resolved_ts(&mut self, events: Events) {
+    fn update_resolved_ts(&mut self, events: Events, min_memory_lock: Option<u64>) {
         assert!(self.role == Role::Leader);
-        let min_lock = *self.lock_cf.iter().min().unwrap_or(&u64::MAX);
-        let new_resolved_ts = min(now(), min_lock);
-        if new_resolved_ts <= self.resolved_ts && now() > 0 {
-            assert!(self.resolved_ts == 0 || new_resolved_ts == min_lock);
-            self.fail_advance_resolved_ts_stat += 1;
+        let min_lock_in_lock_cf = self.lock_cf.iter().min().copied().unwrap_or(u64::MAX);
+        let candidate = now()
+            .min(min_lock_in_lock_cf)
+            .min(min_memory_lock.unwrap_or(u64::MAX));
+        if candidate <= self.resolved_ts && now() > 0 {
+            assert!(
+                self.resolved_ts == 0
+                    || (candidate == min_lock_in_lock_cf || candidate == min_memory_lock.unwrap())
+            );
+            if candidate == min_lock_in_lock_cf {
+                self.fail_advance_resolved_ts_lock_cf_count += 1;
+            } else if candidate == min_memory_lock.unwrap() {
+                self.fail_advance_resolved_ts_memory_lock_count += 1;
+            } else {
+                panic!();
+            }
         }
-        self.resolved_ts = max(self.resolved_ts, new_resolved_ts);
+        self.resolved_ts = max(self.resolved_ts, candidate);
         self.safe_ts = self.resolved_ts;
 
         let this_region_id = self.region_id;
@@ -1500,8 +1556,12 @@ impl Peer {
             now() + self.advance_interval,
             EventType::ResolvedTsUpdate,
             Box::new(move |model: &mut Model| {
-                let this = Model::find_leader_by_id(&mut model.servers, this_region_id);
-                this.update_resolved_ts(model.events.clone());
+                let this_server_id =
+                    Model::find_leader_by_id(&mut model.servers, this_region_id).server_id;
+                let this_server = Model::find_server_by_id(&mut model.servers, this_server_id);
+                let min_memory_lock = this_server.concurrency_manager.iter().min();
+                let this = this_server.peers.get_mut(&this_region_id).unwrap();
+                this.update_resolved_ts(model.events.clone(), min_memory_lock.copied());
             }),
         ));
     }
@@ -1548,9 +1608,13 @@ struct Server {
     // Vec<(start handle time, task)>, the start time can be reset when collecting metrics. this is **only** used to calculate utilization
     read_workers: Vec<Option<(Time, Request)>>,
     write_workers: Vec<Option<(Time, Request)>>,
+    // holding transactions during prewrite, and block resolved-ts
+    concurrency_manager: HashSet<u64>,
 
+    // config
     // a read request will abort at this time if it cannot finish in time
     read_timeout: Time,
+    enable_async_commit: bool,
 
     // metrics
     error_count: HashMap<Error, u64>,
@@ -1576,8 +1640,9 @@ impl Server {
             write_workers: vec![None; cfg.server_config.num_write_workers],
             read_schedule_wait_stat: Histogram::<Time>::new_with_bounds(NANOSECOND, 60 * SECOND, 3)
                 .unwrap(),
+            concurrency_manager: Default::default(),
             read_timeout: cfg.server_config.read_timeout,
-            error_count: Default::default(),
+            enable_async_commit: cfg.server_config.enable_async_commit,
             write_schedule_wait_stat: Histogram::<Time>::new_with_bounds(
                 NANOSECOND,
                 60 * SECOND,
@@ -1586,6 +1651,7 @@ impl Server {
             .unwrap(),
             read_worker_time: 0,
             write_worker_time: 0,
+            error_count: Default::default(),
             read_req_count: HashMap::new(),
             write_req_count: HashMap::new(),
         }
@@ -1729,6 +1795,10 @@ impl Server {
         let req_size = req.size;
         if req.req_type == EventType::PrewriteRequest {
             peer.lock_cf.insert(req.start_ts);
+            if self.enable_async_commit {
+                // in our model, a txn only writes only to 1 region.
+                assert!(self.concurrency_manager.insert(req.start_ts));
+            }
         }
         self.write_workers[worker_id] = Some((now(), req));
         let this_server_id = self.server_id;
@@ -1744,8 +1814,16 @@ impl Server {
                 let peer = this.peers.get_mut(&task.region_id).unwrap();
                 assert!(peer.role == Role::Leader);
 
-                if task.req_type == EventType::CommitRequest {
-                    assert!(peer.lock_cf.remove(&task.start_ts));
+                match task.req_type {
+                    EventType::PrewriteRequest => {
+                        if this.enable_async_commit {
+                            assert!(this.concurrency_manager.remove(&task.start_ts));
+                        }
+                    }
+                    EventType::CommitRequest => {
+                        assert!(peer.lock_cf.remove(&task.start_ts));
+                    }
+                    _ => {}
                 }
 
                 // schedule next task
@@ -2629,6 +2707,7 @@ enum EventType {
     AppGen,
     CollectMetrics,
     CheckMaxExecutionTime,
+    #[allow(unused)]
     Injection,
 }
 
