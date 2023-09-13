@@ -1,4 +1,5 @@
 use hdrhistogram::Histogram;
+use indicatif::ProgressBar;
 use lazy_static::lazy_static;
 use std::cell::RefCell;
 use std::cmp::{max, min, Ordering};
@@ -13,6 +14,9 @@ use rand::prelude::IteratorRandom;
 use rand::rngs::{OsRng, StdRng};
 use rand::{Rng, SeedableRng};
 use rand_distr::{Distribution, Exp, LogNormal};
+
+#[global_allocator]
+static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 type Events = Rc<RefCell<EventHeap>>;
 
@@ -90,6 +94,7 @@ struct Config {
     max_time: Time,
     metrics_interval: Time,
     server_config: ServerConfig,
+    client_config: ClientConfig,
     app_config: AppConfig,
 }
 
@@ -100,6 +105,11 @@ struct ServerConfig {
     read_timeout: Time,
     advance_interval: Time,
     broadcast_interval: Time,
+}
+
+#[derive(Clone)]
+struct ClientConfig {
+    max_execution_time: Time,
 }
 
 #[derive(Clone)]
@@ -120,7 +130,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config {
         num_replica: 3,
         num_region: 100,
-        max_time: 1200 * SECOND,
+        max_time: 1500 * SECOND,
         metrics_interval: SECOND,
         server_config: ServerConfig {
             num_read_workers: 10,
@@ -128,6 +138,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             read_timeout: SECOND,
             advance_interval: 5 * SECOND,
             broadcast_interval: 5 * SECOND,
+        },
+        client_config: ClientConfig {
+            max_execution_time: 10 * SECOND,
         },
         app_config: AppConfig {
             retry: false,
@@ -152,9 +165,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Server::new(Zone::AZ3, events.clone(), &config),
         ],
         clients: vec![
-            Client::new(Zone::AZ1, events.clone()),
-            Client::new(Zone::AZ2, events.clone()),
-            Client::new(Zone::AZ3, events.clone()),
+            Client::new(Zone::AZ1, events.clone(), &config),
+            Client::new(Zone::AZ2, events.clone(), &config),
+            Client::new(Zone::AZ3, events.clone(), &config),
         ],
         app: App::new(events.clone(), &config),
         app_ok_transaction_durations: vec![],
@@ -173,6 +186,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     model.init(&config);
     model.inject();
 
+    let bar = ProgressBar::new(config.max_time / SECOND);
     loop {
         let mut events_mut = events.borrow_mut();
         let event = match events_mut.pop() {
@@ -186,11 +200,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         // time cannot go back
         assert!(now() <= event.trigger_time);
+        bar.set_position(now() / SECOND);
         CURRENT_TIME.store(event.trigger_time, atomic::Ordering::SeqCst);
         drop(events_mut);
         (event.f)(&mut model);
     }
-
+    bar.finish();
     draw_metrics(&model, &config)?;
     Ok(())
 }
@@ -1903,10 +1918,13 @@ struct Client {
     latency_stat: Histogram<Time>,
     error_latency_stat: HashMap<Error, Histogram<Time>>,
     success_latency_stat: HashMap<EventType, Histogram<Time>>,
+
+    // config
+    max_execution_time: Time,
 }
 
 impl Client {
-    fn new(zone: Zone, events: Events) -> Self {
+    fn new(zone: Zone, events: Events, cfg: &Config) -> Self {
         Self {
             id: CLIENT_COUNTER.fetch_add(1, atomic::Ordering::SeqCst),
             zone,
@@ -1915,6 +1933,7 @@ impl Client {
             latency_stat: Histogram::<Time>::new_with_bounds(NANOSECOND, 60 * SECOND, 3).unwrap(),
             error_latency_stat: HashMap::new(),
             success_latency_stat: HashMap::new(),
+            max_execution_time: cfg.client_config.max_execution_time,
         }
     }
 
@@ -1942,11 +1961,17 @@ impl Client {
             req.req_id,
             selector.borrow().state,
         ));
+        let req_id = req.req_id;
+        let mut req_clone = req.clone();
         self.pending_tasks
-            .insert(req.req_id, (now(), selector.clone()));
+            .entry(req.req_id)
+            .or_insert_with(|| (now(), selector.clone()));
         // we should decide the target *now*, but to access the server list in the model, we decide when
         // the event the rpc is to be accepted by the server.
-        self.events.borrow_mut().push(Event::new(
+        let mut events = self.events.borrow_mut();
+        let this_client_id = self.id;
+
+        events.push(Event::new(
             now() + rpc_latency(false),
             req.req_type,
             Box::new(move |model: &mut Model| {
@@ -1957,6 +1982,8 @@ impl Client {
                     server.on_req(req);
                 } else {
                     // no server available, return error
+                    let this = model.find_client_by_id(this_client_id);
+                    this.pending_tasks.remove(&req_id).unwrap();
                     model.events.borrow_mut().push(Event::new(
                         now() + rpc_latency(false),
                         EventType::AppResp,
@@ -1967,10 +1994,59 @@ impl Client {
                 }
             }),
         ));
+
+        // check max_execution_timeout, if it did not get a response in time, abort and return error to app
+        events.push(Event::new(
+            now() + self.max_execution_time,
+            EventType::CheckMaxExecutionTime,
+            Box::new(move |model: &mut Model| {
+                let this = Model::find_client_by_id(model, this_client_id);
+                if let Some((start_time, _)) = this.pending_tasks.remove(&req_id) {
+                    this.error_latency_stat
+                        .entry(Error::MaxExecutionTimeExceeded)
+                        .or_insert_with(|| {
+                            Histogram::<Time>::new_with_bounds(1, 60 * SECOND, 3).unwrap()
+                        })
+                        .record(now() - start_time)
+                        .unwrap();
+                    assert_eq!(
+                        now() - start_time,
+                        this.max_execution_time,
+                        "now: {}, start_time: {}, max_execution_time: {}",
+                        now().pretty_print(),
+                        start_time.pretty_print(),
+                        this.max_execution_time.pretty_print()
+                    );
+
+                    req_clone.trace.messages.push(format!(
+                        "{}: client {}-{}, max execution time exceeded for req {}",
+                        now().pretty_print(),
+                        this.zone,
+                        this.id,
+                        req_id,
+                    ));
+
+                    this.events.borrow_mut().push(Event::new(
+                        now() + rpc_latency(false),
+                        EventType::AppResp,
+                        Box::new(move |model: &mut Model| {
+                            model
+                                .app
+                                .on_resp(req_clone, Some(Error::MaxExecutionTimeExceeded));
+                        }),
+                    ));
+                }
+            }),
+        ))
     }
 
     fn on_resp(&mut self, mut req: Request, error: Option<Error>) {
-        let (start_time, selector) = self.pending_tasks.get(&req.req_id).unwrap();
+        let entry = self.pending_tasks.get(&req.req_id);
+        if entry.is_none() {
+            // must be max execution time exceeded
+            return;
+        }
+        let (start_time, selector) = entry.unwrap();
         self.latency_stat.record(now() - start_time).unwrap();
 
         if let Some(e) = error {
@@ -2003,7 +2079,7 @@ impl Client {
                 .record(now() - start_time)
                 .unwrap();
             // success. respond to app
-            self.pending_tasks.remove(&req.req_id);
+            self.pending_tasks.remove(&req.req_id).unwrap();
             self.events.borrow_mut().push(Event::new(
                 now() + rpc_latency(false),
                 EventType::AppResp,
@@ -2237,6 +2313,7 @@ impl App {
                     .borrow_mut()
                     .messages
                     .extend(req.trace.messages.drain(..));
+                req.req_id = TASK_COUNTER.fetch_add(1, atomic::Ordering::SeqCst);
                 self.issue_request(zone, req, trace);
             } else {
                 // application doesn't retry
@@ -2366,7 +2443,7 @@ impl Request {
             start_ts,
             stale_read_ts,
             req_type,
-            req_id: req_id,
+            req_id,
             client_id,
             size,
             region_id: region,
@@ -2469,6 +2546,7 @@ enum EventType {
     AppResp,
     AppGen,
     CollectMetrics,
+    CheckMaxExecutionTime,
 }
 
 impl Display for EventType {
@@ -2486,6 +2564,7 @@ impl Display for EventType {
             EventType::AppResp => write!(f, "AppResp"),
             EventType::AppGen => write!(f, "AppGen"),
             EventType::CollectMetrics => write!(f, "CollectMetrics"),
+            EventType::CheckMaxExecutionTime => write!(f, "CheckMaxExecutionTime"),
         }
     }
 }
@@ -2497,6 +2576,7 @@ enum Error {
     // all servers are unavailable
     RegionUnavailable,
     DataIsNotReady,
+    MaxExecutionTimeExceeded,
 }
 
 impl Display for Error {
@@ -2505,6 +2585,7 @@ impl Display for Error {
             Error::ReadTimeout => write!(f, "ReadTimeout"),
             Error::RegionUnavailable => write!(f, "RegionUnavailable"),
             Error::DataIsNotReady => write!(f, "DataIsNotReady"),
+            Error::MaxExecutionTimeExceeded => write!(f, "MaxExecutionTimeExceeded"),
         }
     }
 }
