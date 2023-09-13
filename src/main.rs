@@ -1189,22 +1189,6 @@ impl Model {
 
     fn collect_metrics(&mut self) {
         {
-            let mut count = 0;
-            for server in &self.servers {
-                for peer in server.peers.values() {
-                    if now() - peer.safe_ts > 10 * SECOND {
-                        count += 1;
-                    }
-                }
-            }
-            println!(
-                "now {}, {} peers' safe-ts lag more than 10s",
-                now().pretty_print(),
-                count
-            );
-        }
-
-        {
             self.app_ok_transaction_durations
                 .push(self.app.txn_duration_stat.clone());
             self.app.txn_duration_stat.reset();
@@ -1370,6 +1354,16 @@ impl Zone {
             1 => Zone::AZ2,
             2 => Zone::AZ3,
             _ => panic!("invalid zone"),
+        }
+    }
+}
+
+impl Display for Zone {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Zone::AZ1 => write!(f, "AZ1"),
+            Zone::AZ2 => write!(f, "AZ2"),
+            Zone::AZ3 => write!(f, "AZ3"),
         }
     }
 }
@@ -1904,12 +1898,27 @@ impl Client {
     // app sends a req to client
     fn on_req(&mut self, mut req: Request) {
         req.client_id = self.id;
+        req.trace.messages.push(format!(
+            "{}: client {}-{} received req {}",
+            now().pretty_print(),
+            self.zone,
+            self.id,
+            req.req_id,
+        ));
         let selector = Rc::new(RefCell::new(PeerSelector::new(self.zone, &req)));
         self.issue_request(req, selector);
     }
 
     // send the req to the appropriate peer. If all peers have been tried, return error to app.
     fn issue_request(&mut self, mut req: Request, selector: Rc<RefCell<PeerSelector>>) {
+        req.trace.messages.push(format!(
+            "{}: client {}-{} issued req {}, selector_state {}",
+            now().pretty_print(),
+            self.zone,
+            self.id,
+            req.req_id,
+            selector.borrow().state,
+        ));
         self.pending_tasks
             .insert(req.req_id, (now(), selector.clone()));
         // we should decide the target *now*, but to access the server list in the model, we decide when
@@ -1937,11 +1946,19 @@ impl Client {
         ));
     }
 
-    fn on_resp(&mut self, req: Request, error: Option<Error>) {
+    fn on_resp(&mut self, mut req: Request, error: Option<Error>) {
         let (start_time, selector) = self.pending_tasks.get(&req.req_id).unwrap();
         self.latency_stat.record(now() - start_time).unwrap();
 
         if let Some(e) = error {
+            req.trace.messages.push(format!(
+                "{}: client {}-{} received error {} for req {}",
+                now().pretty_print(),
+                self.zone,
+                self.id,
+                e,
+                req.req_id,
+            ));
             self.error_latency_stat
                 .entry(e)
                 .or_insert_with(|| Histogram::<Time>::new_with_bounds(1, 60 * SECOND, 3).unwrap())
@@ -1950,6 +1967,13 @@ impl Client {
             // retry other peers
             self.issue_request(req, selector.clone());
         } else {
+            req.trace.messages.push(format!(
+                "{}: client {}-{} received success for req {}",
+                now().pretty_print(),
+                self.zone,
+                self.id,
+                req.req_id,
+            ));
             self.success_latency_stat
                 .entry(req.req_type)
                 .or_insert_with(|| Histogram::<Time>::new_with_bounds(1, 60 * SECOND, 3).unwrap())
@@ -2004,6 +2028,19 @@ enum CommitPhase {
     ReadOnly,
 }
 
+#[derive(Default)]
+struct TransactionTrace {
+    messages: Vec<String>,
+}
+
+impl TransactionTrace {
+    fn dump(&self) {
+        for msg in &self.messages {
+            println!("{}", msg);
+        }
+    }
+}
+
 struct Transaction {
     zone: Zone,
     // start_ts, also the unique id of transactions
@@ -2017,6 +2054,7 @@ struct Transaction {
     commit_phase: CommitPhase,
     prewrite_req: Option<Request>,
     commit_req: Option<Request>,
+    trace: Rc<RefCell<TransactionTrace>>,
 }
 
 impl Transaction {
@@ -2066,6 +2104,13 @@ impl Transaction {
             ));
         }
 
+        let trace = Rc::new(RefCell::new(TransactionTrace::default()));
+        trace.borrow_mut().messages.push(format!(
+            "{}: txn created with start_ts {}",
+            now().pretty_print(),
+            start_ts.pretty_print()
+        ));
+
         Self {
             zone: Zone::rand_zone(),
             start_ts,
@@ -2079,6 +2124,7 @@ impl Transaction {
             stale_read_ts,
             prewrite_req,
             commit_req,
+            trace,
         }
     }
 }
@@ -2120,8 +2166,9 @@ impl App {
         );
         let zone = txn.zone;
         let req = txn.remaining_queries.pop_front().unwrap();
+        let trace = txn.trace.clone();
         self.pending_transactions.insert(txn.start_ts, txn);
-        self.issue_request(zone, req);
+        self.issue_request(zone, req, trace);
 
         // Invariant: interval must be > 0, to avoid infinite loop.
         // And to make start_ts unique as start_ts is using now() directly
@@ -2135,16 +2182,46 @@ impl App {
         ));
     }
 
-    fn on_resp(&mut self, req: Request, error: Option<Error>) {
+    fn on_resp(&mut self, mut req: Request, error: Option<Error>) {
+        let txn = self.pending_transactions.get_mut(&req.start_ts);
+        if txn.is_none() {
+            eprintln!(
+                "txn not found: start_ts {} {}, could be an injected req",
+                req.start_ts.pretty_print(),
+                req.req_type
+            );
+            return;
+        }
+        let txn = txn.unwrap();
+        txn.trace
+            .borrow_mut()
+            .messages
+            .extend(req.trace.messages.drain(..));
+
         if let Some(error) = error {
             if self.retry {
                 // application retry immediately
-                let txn = self.pending_transactions.get(&req.start_ts).unwrap();
+                txn.trace.borrow_mut().messages.push(format!(
+                    "retrying from app side, now {}, error: {}",
+                    now().pretty_print(),
+                    error
+                ));
                 self.retry_count += 1;
-                self.issue_request(txn.zone, req);
+                let zone = txn.zone;
+                let trace = txn.trace.clone();
+                trace
+                    .borrow_mut()
+                    .messages
+                    .extend(req.trace.messages.drain(..));
+                self.issue_request(zone, req, trace);
             } else {
                 // application doesn't retry
                 let txn = self.pending_transactions.remove(&req.start_ts).unwrap();
+                txn.trace.borrow_mut().messages.push(format!(
+                    "txn failed, now {}, error: {}",
+                    now().pretty_print(),
+                    error
+                ));
                 self.failed_txn_stat
                     .entry(error)
                     .or_insert_with(|| {
@@ -2155,16 +2232,11 @@ impl App {
             }
         } else {
             // success
-            let txn = self.pending_transactions.get_mut(&req.start_ts);
-            if txn.is_none() {
-                eprintln!(
-                    "txn not found: start_ts {} {}, could be an injected req",
-                    req.start_ts.pretty_print(),
-                    req.req_type
-                );
-                return;
-            }
-            let txn = txn.unwrap();
+            txn.trace.borrow_mut().messages.push(format!(
+                "{}: received ok response for req {}",
+                now().pretty_print(),
+                req.req_id,
+            ));
             match txn.commit_phase {
                 CommitPhase::ReadOnly => {
                     // no need to prewrite and commit. finish all read queries
@@ -2172,7 +2244,8 @@ impl App {
                     if let Some(req) = txn.remaining_queries.pop_front() {
                         // send next query
                         let zone = txn.zone;
-                        self.issue_request(zone, req);
+                        let trace = txn.trace.clone();
+                        self.issue_request(zone, req, trace);
                     } else {
                         txn.commit_phase = CommitPhase::Committed;
                         self.txn_duration_stat.record(now() - txn.start_ts).unwrap();
@@ -2183,13 +2256,15 @@ impl App {
                     if let Some(req) = txn.remaining_queries.pop_front() {
                         // send next query
                         let zone = txn.zone;
-                        self.issue_request(zone, req);
+                        let trace = txn.trace.clone();
+                        self.issue_request(zone, req, trace);
                     } else {
                         txn.commit_phase = CommitPhase::Prewriting;
                         // send prewrite request
                         let zone = txn.zone;
                         let prewrite_req = txn.prewrite_req.take().unwrap();
-                        self.issue_request(zone, prewrite_req);
+                        let trace = txn.trace.clone();
+                        self.issue_request(zone, prewrite_req, trace);
                     }
                 }
                 CommitPhase::Prewriting => {
@@ -2198,7 +2273,8 @@ impl App {
                     let zone = txn.zone;
                     txn.commit_ts = now();
                     let commit_req = txn.commit_req.take().unwrap();
-                    self.issue_request(zone, commit_req);
+                    let trace = txn.trace.clone();
+                    self.issue_request(zone, commit_req, trace);
                 }
                 CommitPhase::Committing => {
                     txn.commit_phase = CommitPhase::Committed;
@@ -2212,7 +2288,14 @@ impl App {
         }
     }
 
-    fn issue_request(&mut self, zone: Zone, req: Request) {
+    fn issue_request(&mut self, zone: Zone, req: Request, trace: Rc<RefCell<TransactionTrace>>) {
+        trace.borrow_mut().messages.push(format!(
+            "{}: sending req {}-{} to zone {}",
+            now().pretty_print(),
+            req.req_type,
+            req.req_id,
+            zone,
+        ));
         self.events.borrow_mut().push(Event::new(
             now() + rpc_latency(false),
             req.req_type,
@@ -2221,6 +2304,11 @@ impl App {
             }),
         ));
     }
+}
+
+#[derive(Clone, Default)]
+struct RequestTrace {
+    messages: Vec<String>,
 }
 
 // a request, its content are permanent and immutable, even if it's sent to multiple servers.
@@ -2237,6 +2325,7 @@ struct Request {
 
     // metrics
     selector_state: PeerSelectorState,
+    trace: RequestTrace,
 }
 
 impl Request {
@@ -2248,15 +2337,24 @@ impl Request {
         client_id: u64,
         region: u64,
     ) -> Self {
+        let req_id = TASK_COUNTER.fetch_add(1, atomic::Ordering::SeqCst);
         Self {
             start_ts,
             stale_read_ts,
             req_type,
-            req_id: TASK_COUNTER.fetch_add(1, atomic::Ordering::SeqCst),
+            req_id: req_id,
             client_id,
             size,
             region_id: region,
             selector_state: PeerSelectorState::Unknown,
+            trace: RequestTrace {
+                messages: vec![format!(
+                    "{}: req {}-{} created",
+                    now().pretty_print(),
+                    req_type,
+                    req_id,
+                )],
+            },
         }
     }
 }
