@@ -100,6 +100,7 @@ struct Config {
 
 #[derive(Clone)]
 struct ServerConfig {
+    async_commit: bool,
     num_read_workers: usize,
     num_write_workers: usize,
     read_timeout: Time,
@@ -129,10 +130,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let events: Rc<RefCell<EventHeap>> = Rc::new(RefCell::new(EventHeap::new()));
     let config = Config {
         num_replica: 3,
-        num_region: 100,
-        max_time: 1500 * SECOND,
+        num_region: 10000,
+        max_time: 900 * SECOND,
         metrics_interval: SECOND,
         server_config: ServerConfig {
+            async_commit: true,
             num_read_workers: 10,
             num_write_workers: 10,
             read_timeout: SECOND,
@@ -140,7 +142,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             broadcast_interval: 5 * SECOND,
         },
         client_config: ClientConfig {
-            max_execution_time: 10 * SECOND,
+            max_execution_time: 20 * SECOND,
         },
         app_config: AppConfig {
             retry: false,
@@ -182,6 +184,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         server_write_worker_busy_time: vec![],
         server_read_req_count: vec![],
         server_write_req_count: vec![],
+        server_error_count: vec![],
     };
     model.init(&config);
     model.inject();
@@ -212,7 +215,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
     use plotters::prelude::*;
-    let num_graphs = 14usize + 3/* num_server*/;
+    let num_graphs = 14usize + 2 * 3/* num_server*/;
     let root = SVGBackend::new("0.svg", (1200, num_graphs as u32 * 300)).into_drawing_area();
     let children_area = root.split_evenly(((num_graphs + 1) / 2, 2));
     let xs = (0..=model.app_ok_transaction_durations.len()).map(|i| i as f32);
@@ -1038,6 +1041,67 @@ fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::E
             .draw()?;
     }
 
+    // server error rates
+    {
+        for server in &model.servers {
+            chart_id += 1;
+            let mut chart = ChartBuilder::on(&children_area[chart_id])
+                .caption(
+                    format!("server-{} error rates (per interval)", server.server_id),
+                    font.clone(),
+                )
+                .margin(30)
+                .x_label_area_size(30)
+                .y_label_area_size(30)
+                .build_cartesian_2d(
+                    0f32..model.server_error_count.len() as f32,
+                    0f32..(*model
+                        .server_error_count
+                        .iter()
+                        .map(|x| {
+                            x.get(&server.server_id)
+                                .map(|x| x.values().max().unwrap_or(&0))
+                                .unwrap_or(&0)
+                        })
+                        .max()
+                        .unwrap_or(&0) as f32
+                        * 1.2)
+                        .max(1.0),
+                )?;
+
+            chart.configure_mesh().disable_mesh().draw()?;
+            let errors = model
+                .server_error_count
+                .iter()
+                .flat_map(|x| {
+                    x.get(&server.server_id)
+                        .map(|x| x.keys().copied().collect::<HashSet<_>>())
+                        .unwrap_or_default()
+                })
+                .collect::<HashSet<_>>();
+
+            for (i, error) in errors.iter().enumerate() {
+                chart
+                    .draw_series(LineSeries::new(
+                        xs.clone().zip(model.server_error_count.iter().map(|x| {
+                            x.get(&server.server_id)
+                                .map(|x| x.get(error).copied().unwrap_or(0) as f32)
+                                .unwrap_or(0.0)
+                        })),
+                        colors[i],
+                    ))?
+                    .label(error.to_string())
+                    .legend(move |(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], colors[i]));
+            }
+
+            chart
+                .configure_series_labels()
+                .position(SeriesLabelPosition::UpperLeft)
+                .background_style(WHITE.mix(0.5))
+                .draw()?;
+        }
+    }
+
     root.present()?;
     Ok(())
 }
@@ -1072,11 +1136,17 @@ struct Model {
     server_write_worker_busy_time: Vec<HashMap<u64, u64>>,
     server_read_req_count: Vec<HashMap<u64, HashMap<PeerSelectorState, u64>>>,
     server_write_req_count: Vec<HashMap<u64, HashMap<PeerSelectorState, u64>>>,
+    server_error_count: Vec<HashMap<u64, HashMap<Error, u64>>>,
 }
 
 impl Model {
     fn inject(&mut self) {
-        let region_id = rand::thread_rng().gen_range(0..self.app.num_region);
+        let region_id = 1;
+        println!(
+            "inject lock in region {} in server {}",
+            region_id,
+            Self::find_leader_by_id(&mut self.servers, region_id).server_id
+        );
         let mut events = self.events.borrow_mut();
         let start_ts = 300 * SECOND;
         events.push(Event::new(
@@ -1097,7 +1167,7 @@ impl Model {
             }),
         ));
         events.push(Event::new(
-            700 * SECOND,
+            600 * SECOND,
             EventType::CommitRequest,
             Box::new(move |model| {
                 let client = Model::find_client_by_zone(model, Zone::AZ1);
@@ -1345,6 +1415,14 @@ impl Model {
             self.server_write_req_count.push(map);
         }
 
+        {
+            let mut map = HashMap::new();
+            for server in &mut self.servers {
+                map.insert(server.server_id, server.error_count.drain().collect());
+            }
+            self.server_error_count.push(map);
+        }
+
         self.events.borrow_mut().push(Event::new(
             now() + self.metrics_interval,
             EventType::CollectMetrics,
@@ -1475,7 +1553,7 @@ struct Server {
     read_timeout: Time,
 
     // metrics
-    error_count: u64,
+    error_count: HashMap<Error, u64>,
     write_schedule_wait_stat: Histogram<Time>,
     read_schedule_wait_stat: Histogram<Time>,
     // total busy time, in each metrics interval
@@ -1499,7 +1577,7 @@ impl Server {
             read_schedule_wait_stat: Histogram::<Time>::new_with_bounds(NANOSECOND, 60 * SECOND, 3)
                 .unwrap(),
             read_timeout: cfg.server_config.read_timeout,
-            error_count: 0,
+            error_count: Default::default(),
             write_schedule_wait_stat: Histogram::<Time>::new_with_bounds(
                 NANOSECOND,
                 60 * SECOND,
@@ -1567,6 +1645,8 @@ impl Server {
                     self.handle_read(worker_id, task, accept_time);
                 }
 
+                *self.error_count.entry(Error::DataIsNotReady).or_default() += 1;
+
                 // return DataIsNotReady error
                 self.events.borrow_mut().push(Event::new(
                     now() + rpc_latency(false),
@@ -1589,7 +1669,7 @@ impl Server {
                 EventType::ReadRequestTimeout,
                 Box::new(move |model: &mut Model| {
                     let this = Model::find_server_by_id(&mut model.servers, this_server_id);
-                    this.error_count += 1;
+                    *this.error_count.entry(Error::ReadTimeout).or_default() += 1;
 
                     // schedule next task in queue
                     let (start_time, task) = this.read_workers[worker_id].take().unwrap();
@@ -1652,13 +1732,6 @@ impl Server {
         }
         self.write_workers[worker_id] = Some((now(), req));
         let this_server_id = self.server_id;
-
-        // if self.server_id == 0 {
-        //     // 1% chance req_size += 1 second
-        //     if rand::random::<u64>() % 100 == 0 {
-        //         req_size += 1 * SECOND;
-        //     }
-        // }
 
         self.events.borrow_mut().push(Event::new(
             now() + req_size,
@@ -1963,9 +2036,11 @@ impl Client {
         ));
         let req_id = req.req_id;
         let mut req_clone = req.clone();
-        self.pending_tasks
-            .entry(req.req_id)
-            .or_insert_with(|| (now(), selector.clone()));
+        let is_new_request = !self.pending_tasks.contains_key(&req.req_id);
+        if is_new_request {
+            self.pending_tasks
+                .insert(req.req_id, (now(), selector.clone()));
+        }
         // we should decide the target *now*, but to access the server list in the model, we decide when
         // the event the rpc is to be accepted by the server.
         let mut events = self.events.borrow_mut();
@@ -1995,49 +2070,51 @@ impl Client {
             }),
         ));
 
-        // check max_execution_timeout, if it did not get a response in time, abort and return error to app
-        events.push(Event::new(
-            now() + self.max_execution_time,
-            EventType::CheckMaxExecutionTime,
-            Box::new(move |model: &mut Model| {
-                let this = Model::find_client_by_id(model, this_client_id);
-                if let Some((start_time, _)) = this.pending_tasks.remove(&req_id) {
-                    this.error_latency_stat
-                        .entry(Error::MaxExecutionTimeExceeded)
-                        .or_insert_with(|| {
-                            Histogram::<Time>::new_with_bounds(1, 60 * SECOND, 3).unwrap()
-                        })
-                        .record(now() - start_time)
-                        .unwrap();
-                    assert_eq!(
-                        now() - start_time,
-                        this.max_execution_time,
-                        "now: {}, start_time: {}, max_execution_time: {}",
-                        now().pretty_print(),
-                        start_time.pretty_print(),
-                        this.max_execution_time.pretty_print()
-                    );
+        if is_new_request {
+            // check max_execution_timeout, if it did not get a response in time, abort and return error to app
+            events.push(Event::new(
+                now() + self.max_execution_time,
+                EventType::CheckMaxExecutionTime,
+                Box::new(move |model: &mut Model| {
+                    let this = Model::find_client_by_id(model, this_client_id);
+                    if let Some((start_time, _)) = this.pending_tasks.remove(&req_id) {
+                        this.error_latency_stat
+                            .entry(Error::MaxExecutionTimeExceeded)
+                            .or_insert_with(|| {
+                                Histogram::<Time>::new_with_bounds(1, 60 * SECOND, 3).unwrap()
+                            })
+                            .record(now() - start_time)
+                            .unwrap();
+                        assert_eq!(
+                            now() - start_time,
+                            this.max_execution_time,
+                            "now: {}, start_time: {}, max_execution_time: {}",
+                            now().pretty_print(),
+                            start_time.pretty_print(),
+                            this.max_execution_time.pretty_print()
+                        );
 
-                    req_clone.trace.messages.push(format!(
-                        "{}: client {}-{}, max execution time exceeded for req {}",
-                        now().pretty_print(),
-                        this.zone,
-                        this.id,
-                        req_id,
-                    ));
+                        req_clone.trace.messages.push(format!(
+                            "{}: client {}-{}, max execution time exceeded for req {}",
+                            now().pretty_print(),
+                            this.zone,
+                            this.id,
+                            req_id,
+                        ));
 
-                    this.events.borrow_mut().push(Event::new(
-                        now() + rpc_latency(false),
-                        EventType::AppResp,
-                        Box::new(move |model: &mut Model| {
-                            model
-                                .app
-                                .on_resp(req_clone, Some(Error::MaxExecutionTimeExceeded));
-                        }),
-                    ));
-                }
-            }),
-        ))
+                        this.events.borrow_mut().push(Event::new(
+                            now() + rpc_latency(false),
+                            EventType::AppResp,
+                            Box::new(move |model: &mut Model| {
+                                model
+                                    .app
+                                    .on_resp(req_clone, Some(Error::MaxExecutionTimeExceeded));
+                            }),
+                        ));
+                    }
+                }),
+            ))
+        }
     }
 
     fn on_resp(&mut self, mut req: Request, error: Option<Error>) {
@@ -2103,6 +2180,7 @@ struct App {
     read_staleness: Option<Time>,
     num_region: u64,
     retry_count: u64,
+    stop: bool,
 
     // configs
     read_size_fn: Rc<dyn Fn() -> Time>,
@@ -2234,6 +2312,7 @@ impl App {
     fn new(events: Events, cfg: &Config) -> Self {
         Self {
             events,
+            stop: false,
             rng: StdRng::from_seed(OsRng.gen()),
             rate_exp_dist: Exp::new(cfg.app_config.txn_rate).unwrap(),
             pending_transactions: HashMap::new(),
@@ -2277,6 +2356,9 @@ impl App {
             now() + interval,
             EventType::AppGen,
             Box::new(move |model: &mut Model| {
+                if model.app.stop {
+                    return;
+                }
                 model.app.gen_txn();
             }),
         ));
@@ -2547,6 +2629,7 @@ enum EventType {
     AppGen,
     CollectMetrics,
     CheckMaxExecutionTime,
+    Injection,
 }
 
 impl Display for EventType {
@@ -2565,6 +2648,7 @@ impl Display for EventType {
             EventType::AppGen => write!(f, "AppGen"),
             EventType::CollectMetrics => write!(f, "CollectMetrics"),
             EventType::CheckMaxExecutionTime => write!(f, "CheckMaxExecutionTime"),
+            EventType::Injection => write!(f, "Injection"),
         }
     }
 }

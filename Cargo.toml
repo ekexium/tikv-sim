@@ -15,5 +15,5 @@ indicatif = "0.17.6"
 [patch.crates-io]
 pathfinder_simd = { git = "https://github.com/servo/pathfinder.git", branch = "master" }
 
-[profile.release]
-debug = 1
+#[profile.release]
+#debug = 1
