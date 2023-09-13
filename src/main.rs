@@ -4,6 +4,7 @@ use std::cell::RefCell;
 use std::cmp::{max, min, Ordering};
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fmt::{Display, Formatter};
+use std::hash::Hash;
 use std::rc::Rc;
 use std::sync::atomic;
 use std::sync::atomic::AtomicU64;
@@ -119,7 +120,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config {
         num_replica: 3,
         num_region: 100,
-        max_time: 60 * SECOND,
+        max_time: 900 * SECOND,
         metrics_interval: SECOND,
         server_config: ServerConfig {
             num_read_workers: 10,
@@ -130,12 +131,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         app_config: AppConfig {
             retry: false,
-            txn_rate: 2000.0,
-            read_staleness: Some(SECOND),
+            txn_rate: 3200.0,
+            read_staleness: Some(15 * SECOND),
             read_size_fn: Rc::new(|| (rand::random::<u64>() % 5 + 1) * MILLISECOND),
             prewrite_size_fn: Rc::new(|| (rand::random::<u64>() % 30 + 1) * MILLISECOND),
             commit_size_fn: Rc::new(|| (rand::random::<u64>() % 20 + 1) * MILLISECOND),
-            num_queries_fn: Rc::new(|| 10),
+            num_queries_fn: Rc::new(|| 5),
             read_only_ratio: 0.95,
         },
     };
@@ -166,8 +167,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         advance_resolved_ts_failure: vec![],
         server_read_worker_busy_time: vec![],
         server_write_worker_busy_time: vec![],
+        server_read_req_count: vec![],
+        server_write_req_count: vec![],
     };
     model.init(&config);
+    model.inject();
 
     loop {
         let mut events_mut = events.borrow_mut();
@@ -193,12 +197,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
     use plotters::prelude::*;
-    let num_graphs = 13;
-    let root = SVGBackend::new("0.svg", (800, num_graphs * 600)).into_drawing_area();
-    let children_area = root.split_evenly((num_graphs as usize, 1));
+    let num_graphs = 14usize + 3/* num_server*/;
+    let root = SVGBackend::new("0.svg", (1200, num_graphs as u32 * 300)).into_drawing_area();
+    let children_area = root.split_evenly(((num_graphs + 1) / 2, 2));
     let xs = (0..=model.app_ok_transaction_durations.len()).map(|i| i as f32);
     let font = ("Jetbrains Mono", 15).into_font();
-    // elegant low-saturation colors
     let colors = [
         RGBColor(0x1f, 0x77, 0xb4),
         RGBColor(0xff, 0x7f, 0x0e),
@@ -210,6 +213,26 @@ fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::E
         RGBColor(0x7f, 0x7f, 0x7f),
         RGBColor(0xbc, 0xbd, 0x22),
         RGBColor(0x17, 0xbe, 0xcf),
+        RGBColor(0xa0, 0x52, 0x2d),
+        RGBColor(0x6a, 0x5a, 0xcd),
+        RGBColor(0x20, 0xb2, 0xaa),
+        RGBColor(0x00, 0x64, 0x00),
+        RGBColor(0x8b, 0x00, 0x8b),
+        RGBColor(0x5f, 0x9e, 0xa0),
+        RGBColor(0x9a, 0xcd, 0x32),
+        RGBColor(0xff, 0x45, 0x00),
+        RGBColor(0xda, 0x70, 0xd6),
+        RGBColor(0x00, 0xce, 0xd1),
+        RGBColor(0x40, 0xe0, 0xd0),
+        RGBColor(0xff, 0xd7, 0x00),
+        RGBColor(0xad, 0xff, 0x2f),
+        RGBColor(0xff, 0x69, 0xb4),
+        RGBColor(0xcd, 0x5c, 0x5c),
+        RGBColor(0x4b, 0x00, 0x82),
+        RGBColor(0x87, 0xce, 0xeb),
+        RGBColor(0x32, 0xcd, 0x32),
+        RGBColor(0x6b, 0x8e, 0x23),
+        RGBColor(0xff, 0xa5, 0x00),
     ];
 
     let mut chart_id = 0;
@@ -677,37 +700,58 @@ fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::E
     // server_max_resolved_ts_gap
     {
         chart_id += 1;
-        let mut chart_max_resolved_ts_gap = ChartBuilder::on(&children_area[chart_id])
-            .caption("max resolved ts gap", font.clone())
+        let mut chart = ChartBuilder::on(&children_area[chart_id])
+            .caption("max resolved ts gap (per interval)", font.clone())
             .margin(30)
             .x_label_area_size(30)
             .y_label_area_size(30)
+            .set_label_area_size(LabelAreaPosition::Left, 60)
             .build_cartesian_2d(
                 0f32..model.server_max_resolved_ts_gap.len() as f32,
-                0f32..(*model
+                0f32..(model
                     .server_max_resolved_ts_gap
-                    .clone()
                     .iter()
+                    .map(|x| x.values().copied().max().unwrap_or(0))
                     .max()
-                    .unwrap_or(&0)
-                    / SECOND) as f32
-                    * 1.2,
+                    .unwrap() as f32
+                    * 1.2
+                    / SECOND as f32)
+                    .max(1.0),
             )?;
 
-        chart_max_resolved_ts_gap
+        chart
             .configure_mesh()
-            .disable_mesh()
+            // .disable_mesh()
+            .y_label_formatter(&|x| format!("{:.1}s", x))
+            .y_labels(10)
             .draw()?;
-        chart_max_resolved_ts_gap.draw_series(LineSeries::new(
-            xs.clone().zip(
-                model
-                    .server_max_resolved_ts_gap
-                    .clone()
-                    .iter()
-                    .map(|x| (*x / SECOND) as f32),
-            ),
-            &colors[0],
-        ))?;
+
+        let server_ids = model
+            .server_max_resolved_ts_gap
+            .iter()
+            .flat_map(|x| x.keys())
+            .collect::<HashSet<_>>();
+
+        for (i, server_id) in server_ids.iter().enumerate() {
+            chart
+                .draw_series(LineSeries::new(
+                    xs.clone().zip(
+                        model
+                            .server_max_resolved_ts_gap
+                            .iter()
+                            .map(|x| x.get(server_id).copied().unwrap_or(0) as f32 / SECOND as f32),
+                    ),
+                    colors[i],
+                ))?
+                .label(format!("server-{}", server_id))
+                .legend(move |(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], colors[i]));
+        }
+
+        chart
+            .configure_series_labels()
+            .position(SeriesLabelPosition::UpperLeft)
+            .background_style(WHITE.mix(0.5))
+            .draw()?;
     }
 
     // advance_ts_fail_count
@@ -807,7 +851,7 @@ fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::E
             .draw()?;
     }
 
-    // write pool utilization
+    // write worker utilization
     {
         chart_id += 1;
         let mut chart = ChartBuilder::on(&children_area[chart_id])
@@ -856,6 +900,129 @@ fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::E
             .draw()?;
     }
 
+    // server read req count
+    {
+        // draw graph for each server
+        for server in &model.servers {
+            chart_id += 1;
+            let mut chart = ChartBuilder::on(&children_area[chart_id])
+                .caption(
+                    format!("server-{} read req count", server.server_id),
+                    font.clone(),
+                )
+                .margin(30)
+                .x_label_area_size(30)
+                .y_label_area_size(30)
+                .build_cartesian_2d(
+                    0f32..model.server_read_req_count.len() as f32,
+                    0f32..(*model
+                        .server_read_req_count
+                        .iter()
+                        .map(|x| {
+                            x.get(&server.server_id)
+                                .map(|x| x.values().max().unwrap_or(&0))
+                                .unwrap_or(&0)
+                        })
+                        .max()
+                        .unwrap_or(&0) as f32
+                        * 1.2)
+                        .max(1.0),
+                )?;
+
+            chart.configure_mesh().disable_mesh().draw()?;
+            let states: HashSet<PeerSelectorState> = model
+                .server_read_req_count
+                .iter()
+                .flat_map(|x| {
+                    x.get(&server.server_id)
+                        .map(|x| x.keys().copied().collect::<HashSet<_>>())
+                        .unwrap_or_default()
+                })
+                .collect();
+            let mut states: Vec<_> = states.into_iter().collect();
+            states.sort();
+
+            for (i, state) in states.iter().enumerate() {
+                chart
+                    .draw_series(LineSeries::new(
+                        xs.clone().zip(model.server_read_req_count.iter().map(|x| {
+                            x.get(&server.server_id)
+                                .map(|x| x.get(state).copied().unwrap_or(0) as f32)
+                                .unwrap_or(0.0)
+                        })),
+                        colors[i],
+                    ))?
+                    .label(state.to_string())
+                    .legend(move |(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], colors[i]));
+            }
+
+            chart
+                .configure_series_labels()
+                .position(SeriesLabelPosition::UpperLeft)
+                .background_style(WHITE.mix(0.5))
+                .draw()?;
+        }
+    }
+
+    // server write request count
+    {
+        chart_id += 1;
+        let mut chart = ChartBuilder::on(&children_area[chart_id])
+            .caption("server write req count", font.clone())
+            .margin(30)
+            .x_label_area_size(30)
+            .y_label_area_size(30)
+            .build_cartesian_2d(
+                0f32..model.server_write_req_count.len() as f32,
+                0f32..(*model
+                    .server_write_req_count
+                    .iter()
+                    .map(|x| {
+                        x.values()
+                            .map(|x| x.values().max().unwrap_or(&0))
+                            .max()
+                            .unwrap_or(&0)
+                    })
+                    .max()
+                    .unwrap_or(&0) as f32
+                    * 1.2)
+                    .max(1.0),
+            )?;
+
+        chart.configure_mesh().disable_mesh().draw()?;
+        let server_state_combinations: HashSet<(&u64, &PeerSelectorState)> = model
+            .server_write_req_count
+            .iter()
+            .flat_map(|x| {
+                x.iter().flat_map(|(server_id, states)| {
+                    states.keys().map(move |state| (server_id, state))
+                })
+            })
+            .collect();
+        let mut server_state_combinations: Vec<_> = server_state_combinations.into_iter().collect();
+        server_state_combinations.sort();
+
+        for (i, (server_id, state)) in server_state_combinations.iter().enumerate() {
+            chart
+                .draw_series(LineSeries::new(
+                    xs.clone().zip(model.server_write_req_count.iter().map(|x| {
+                        x.get(server_id)
+                            .map(|x| x.get(state).copied().unwrap_or(0) as f32)
+                            .unwrap_or(0.0)
+                    })),
+                    colors[i],
+                ))?
+                .label(format!("server-{}-{}", server_id, state))
+                .legend(move |(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], colors[i]));
+        }
+
+        chart
+            .configure_series_labels()
+            .position(SeriesLabelPosition::UpperLeft)
+            .background_style(WHITE.mix(0.5))
+            .draw()?;
+    }
+
     root.present()?;
     Ok(())
 }
@@ -876,8 +1043,8 @@ struct Model {
     app_fail_transaction_durations: Vec<HashMap<Error, Histogram<Time>>>,
     kv_ok_durations: Vec<HashMap<EventType, Histogram<Time>>>,
     kv_error_durations: Vec<HashMap<Error, Histogram<Time>>>,
-    // gauge
-    server_max_resolved_ts_gap: Vec<Time>,
+    // gauge, server_id -> max gap
+    server_max_resolved_ts_gap: Vec<HashMap<u64, u64>>,
     // gauge, server_id -> length
     server_read_queue_length: Vec<HashMap<u64, u64>>,
     // gauge, server_id -> length
@@ -888,9 +1055,51 @@ struct Model {
     server_read_worker_busy_time: Vec<HashMap<u64, u64>>,
     // server id -> total time
     server_write_worker_busy_time: Vec<HashMap<u64, u64>>,
+    server_read_req_count: Vec<HashMap<u64, HashMap<PeerSelectorState, u64>>>,
+    server_write_req_count: Vec<HashMap<u64, HashMap<PeerSelectorState, u64>>>,
 }
 
 impl Model {
+    fn inject(&mut self) {
+        let region_id = rand::thread_rng().gen_range(0..self.app.num_region);
+        let mut events = self.events.borrow_mut();
+        let start_ts = 300 * SECOND;
+        events.push(Event::new(
+            300 * SECOND,
+            EventType::PrewriteRequest,
+            Box::new(move |model| {
+                let client = Model::find_client_by_zone(model, Zone::AZ1);
+                // possible start_ts conflict, but ok
+                let req = Request::new(
+                    start_ts,
+                    None,
+                    EventType::PrewriteRequest,
+                    10 * MILLISECOND,
+                    client.id,
+                    region_id,
+                );
+                client.on_req(req);
+            }),
+        ));
+        events.push(Event::new(
+            700 * SECOND,
+            EventType::CommitRequest,
+            Box::new(move |model| {
+                let client = Model::find_client_by_zone(model, Zone::AZ1);
+                // possible start_ts conflict, but ok
+                let req = Request::new(
+                    start_ts,
+                    None,
+                    EventType::CommitRequest,
+                    10 * MILLISECOND,
+                    client.id,
+                    region_id,
+                );
+                client.on_req(req);
+            }),
+        ));
+    }
+
     fn init(&mut self, cfg: &Config) {
         // create regions
         assert!(self.servers.len() >= self.num_replica);
@@ -980,30 +1189,41 @@ impl Model {
 
     fn collect_metrics(&mut self) {
         {
+            let mut count = 0;
+            for server in &self.servers {
+                for peer in server.peers.values() {
+                    if now() - peer.safe_ts > 10 * SECOND {
+                        count += 1;
+                    }
+                }
+            }
+            println!(
+                "now {}, {} peers' safe-ts lag more than 10s",
+                now().pretty_print(),
+                count
+            );
+        }
+
+        {
             self.app_ok_transaction_durations
                 .push(self.app.txn_duration_stat.clone());
             self.app.txn_duration_stat.reset();
         }
 
-        self.server_max_resolved_ts_gap.push(
-            self.servers
-                .iter()
-                .map(|s| {
-                    s.peers
-                        .values()
-                        .map(|p| {
-                            if p.role == Role::Leader {
-                                now() - p.resolved_ts
-                            } else {
-                                0
-                            }
-                        })
-                        .max()
-                        .unwrap_or(0)
-                })
-                .max()
-                .unwrap_or(0),
-        );
+        {
+            // max resolved ts gap
+            let mut map = HashMap::new();
+            for server in &self.servers {
+                let mut max_gap = 0;
+                for peer in server.peers.values() {
+                    if peer.role == Role::Leader {
+                        max_gap = max_gap.max(now() - peer.resolved_ts);
+                    }
+                }
+                map.insert(server.server_id, max_gap);
+            }
+            self.server_max_resolved_ts_gap.push(map);
+        }
 
         {
             let mut map = HashMap::new();
@@ -1108,6 +1328,22 @@ impl Model {
                 map.insert(server.server_id, t);
             }
             self.server_write_worker_busy_time.push(map);
+        }
+
+        {
+            let mut map = HashMap::new();
+            for server in &mut self.servers {
+                map.insert(server.server_id, server.read_req_count.drain().collect());
+            }
+            self.server_read_req_count.push(map);
+        }
+
+        {
+            let mut map = HashMap::new();
+            for server in &mut self.servers {
+                map.insert(server.server_id, server.write_req_count.drain().collect());
+            }
+            self.server_write_req_count.push(map);
         }
 
         self.events.borrow_mut().push(Event::new(
@@ -1236,6 +1472,8 @@ struct Server {
     // total busy time, in each metrics interval
     read_worker_time: Time,
     write_worker_time: Time,
+    read_req_count: HashMap<PeerSelectorState, u64>,
+    write_req_count: HashMap<PeerSelectorState, u64>,
 }
 
 impl Server {
@@ -1261,12 +1499,15 @@ impl Server {
             .unwrap(),
             read_worker_time: 0,
             write_worker_time: 0,
+            read_req_count: HashMap::new(),
+            write_req_count: HashMap::new(),
         }
     }
 
     fn on_req(&mut self, task: Request) {
         match task.req_type {
             EventType::ReadRequest => {
+                *self.read_req_count.entry(task.selector_state).or_insert(0) += 1;
                 if self.read_workers.iter().all(|w| w.is_some()) {
                     // all busy
                     self.read_task_queue.push_back((now(), task));
@@ -1277,6 +1518,7 @@ impl Server {
                 self.handle_read(worker_id, task, now());
             }
             EventType::PrewriteRequest | EventType::CommitRequest => {
+                *self.write_req_count.entry(task.selector_state).or_insert(0) += 1;
                 // FCFS, no timeout
                 if self.write_workers.iter().all(|w| w.is_some()) {
                     // all busy
@@ -1394,12 +1636,20 @@ impl Server {
         self.write_schedule_wait_stat
             .record(now() - accept_time)
             .unwrap();
-        let req_size = req.size;
+        let mut req_size = req.size;
         if req.req_type == EventType::PrewriteRequest {
             peer.lock_cf.insert(req.start_ts);
         }
         self.write_workers[worker_id] = Some((now(), req));
         let this_server_id = self.server_id;
+
+        // if self.server_id == 0 {
+        //     // 1% chance req_size += 1 second
+        //     if rand::random::<u64>() % 100 == 0 {
+        //         req_size += 1 * SECOND;
+        //     }
+        // }
+
         self.events.borrow_mut().push(Event::new(
             now() + req_size,
             EventType::HandleWrite,
@@ -1436,28 +1686,74 @@ impl Server {
     }
 }
 
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Ord, PartialOrd)]
 enum PeerSelectorState {
+    // the default value of requests, should never use it
+    Unknown,
     StaleRead(StaleReaderState),
     NormalRead(NormalReaderState),
     Write(WriterState),
 }
 
+impl Display for PeerSelectorState {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PeerSelectorState::Unknown => write!(f, "Unknown"),
+            PeerSelectorState::StaleRead(state) => write!(f, "StaleRead-{}", state),
+            PeerSelectorState::NormalRead(state) => write!(f, "NormalRead-{}", state),
+            PeerSelectorState::Write(state) => write!(f, "Write-{}", state),
+        }
+    }
+}
+
 // local(stale) -> leader(normal) -> random follower(normal) -> error
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Ord, PartialOrd)]
 enum StaleReaderState {
     LocalStale,
     LeaderNormal,
     RandomFollowerNormal,
 }
 
+impl Display for StaleReaderState {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StaleReaderState::LocalStale => write!(f, "LocalStale"),
+            StaleReaderState::LeaderNormal => write!(f, "LeaderNormal"),
+            StaleReaderState::RandomFollowerNormal => write!(f, "RandomFollowerNormal"),
+        }
+    }
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Ord, PartialOrd)]
 enum NormalReaderState {
     Local,
     LeaderNormal,
     RandomFollowerNormal,
 }
 
+impl Display for NormalReaderState {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NormalReaderState::Local => write!(f, "Local"),
+            NormalReaderState::LeaderNormal => write!(f, "LeaderNormal"),
+            NormalReaderState::RandomFollowerNormal => write!(f, "RandomFollowerNormal"),
+        }
+    }
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Ord, PartialOrd)]
 enum WriterState {
     Leader,
     LeaderFailed,
+}
+
+impl Display for WriterState {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WriterState::Leader => write!(f, "Leader"),
+            WriterState::LeaderFailed => write!(f, "LeaderFailed"),
+        }
+    }
 }
 
 // TODO: this is a naive one, different from the one in client-go. Take care.
@@ -1574,6 +1870,9 @@ impl PeerSelector {
                     server_id.map(|server_id| Model::find_server_by_id(servers, server_id))
                 }
             },
+            PeerSelectorState::Unknown => {
+                unreachable!()
+            }
         }
     }
 }
@@ -1619,7 +1918,9 @@ impl Client {
             now() + rpc_latency(false),
             req.req_type,
             Box::new(move |model: &mut Model| {
-                let server = selector.borrow_mut().next(&mut model.servers, &mut req);
+                let mut selector = selector.borrow_mut();
+                req.selector_state = selector.state;
+                let server = selector.next(&mut model.servers, &mut req);
                 if let Some(server) = server {
                     server.on_req(req);
                 } else {
@@ -1854,7 +2155,16 @@ impl App {
             }
         } else {
             // success
-            let txn = self.pending_transactions.get_mut(&req.start_ts).unwrap();
+            let txn = self.pending_transactions.get_mut(&req.start_ts);
+            if txn.is_none() {
+                eprintln!(
+                    "txn not found: start_ts {} {}, could be an injected req",
+                    req.start_ts.pretty_print(),
+                    req.req_type
+                );
+                return;
+            }
+            let txn = txn.unwrap();
             match txn.commit_phase {
                 CommitPhase::ReadOnly => {
                     // no need to prewrite and commit. finish all read queries
@@ -1924,6 +2234,9 @@ struct Request {
     // the time needed to finish the task, in microsecond
     size: Time,
     region_id: u64,
+
+    // metrics
+    selector_state: PeerSelectorState,
 }
 
 impl Request {
@@ -1943,6 +2256,7 @@ impl Request {
             client_id,
             size,
             region_id: region,
+            selector_state: PeerSelectorState::Unknown,
         }
     }
 }
