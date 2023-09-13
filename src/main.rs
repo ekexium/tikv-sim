@@ -120,7 +120,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config {
         num_replica: 3,
         num_region: 100,
-        max_time: 900 * SECOND,
+        max_time: 1200 * SECOND,
         metrics_interval: SECOND,
         server_config: ServerConfig {
             num_read_workers: 10,
@@ -1539,6 +1539,7 @@ impl Server {
 
         let task_size = req.size;
         let stale_read_ts = req.stale_read_ts;
+        let is_retry = req.selector_state.is_retry();
         self.read_workers[worker_id] = Some((now(), req));
         let this_server_id = self.server_id;
 
@@ -1566,10 +1567,10 @@ impl Server {
         }
 
         // timeout check
-        if accept_time + self.read_timeout < now() + task_size {
-            // will timeout. It tries for `read_timeout`, and then decide to abort.
+        if !is_retry && accept_time + self.read_timeout < now() + task_size {
+            // will timeout. It tries for until timeout, and then decide to abort.
             self.events.borrow_mut().push(Event::new(
-                accept_time + self.read_timeout,
+                max(accept_time + self.read_timeout, now()),
                 EventType::ReadRequestTimeout,
                 Box::new(move |model: &mut Model| {
                     let this = Model::find_server_by_id(&mut model.servers, this_server_id);
@@ -1630,7 +1631,7 @@ impl Server {
         self.write_schedule_wait_stat
             .record(now() - accept_time)
             .unwrap();
-        let mut req_size = req.size;
+        let req_size = req.size;
         if req.req_type == EventType::PrewriteRequest {
             peer.lock_cf.insert(req.start_ts);
         }
@@ -1687,6 +1688,28 @@ enum PeerSelectorState {
     StaleRead(StaleReaderState),
     NormalRead(NormalReaderState),
     Write(WriterState),
+}
+
+impl PeerSelectorState {
+    fn is_retry(&self) -> bool {
+        match self {
+            PeerSelectorState::Unknown => unreachable!(),
+            PeerSelectorState::StaleRead(s) => match s {
+                StaleReaderState::LocalStale => false,
+                StaleReaderState::LeaderNormal => true,
+                StaleReaderState::RandomFollowerNormal => true,
+            },
+            PeerSelectorState::NormalRead(s) => match s {
+                NormalReaderState::Local => false,
+                NormalReaderState::LeaderNormal => true,
+                NormalReaderState::RandomFollowerNormal => true,
+            },
+            PeerSelectorState::Write(s) => match s {
+                WriterState::Leader => false,
+                WriterState::LeaderFailed => unreachable!(),
+            },
+        }
+    }
 }
 
 impl Display for PeerSelectorState {
@@ -2034,6 +2057,7 @@ struct TransactionTrace {
 }
 
 impl TransactionTrace {
+    #[allow(unused)]
     fn dump(&self) {
         for msg in &self.messages {
             println!("{}", msg);
@@ -2376,7 +2400,13 @@ impl EventHeap {
     }
 
     fn push(&mut self, event: Event) {
-        assert!(now() <= event.trigger_time);
+        assert!(
+            now() <= event.trigger_time,
+            "now {}, {} {}",
+            now(),
+            event.trigger_time,
+            event.event_type
+        );
         self.events.push(event);
     }
 }
