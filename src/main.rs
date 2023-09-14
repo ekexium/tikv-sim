@@ -94,6 +94,8 @@ struct Config {
     num_servers: u64,
     max_time: Time,
     metrics_interval: Time,
+    enable_trace: bool,
+
     server_config: ServerConfig,
     client_config: ClientConfig,
     app_config: AppConfig,
@@ -131,14 +133,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let events: Rc<RefCell<EventHeap>> = Rc::new(RefCell::new(EventHeap::new()));
     let config = Config {
         num_replica: 3,
-        num_region: 10000,
+        num_region: 10002,
         num_servers: 3,
-        max_time: 1200 * SECOND,
+        max_time: 500 * SECOND,
         metrics_interval: SECOND,
+        enable_trace: false,
         server_config: ServerConfig {
             enable_async_commit: true,
-            num_read_workers: 10,
-            num_write_workers: 10,
+            num_read_workers: 1,
+            num_write_workers: 1,
             read_timeout: SECOND,
             advance_interval: 5 * SECOND,
             broadcast_interval: 5 * SECOND,
@@ -148,7 +151,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         app_config: AppConfig {
             retry: false,
-            txn_rate: 3400.0,
+            txn_rate: 350.0,
             read_staleness: Some(12 * SECOND),
             read_size_fn: Rc::new(|| (rand::random::<u64>() % 5 + 1) * MILLISECOND),
             prewrite_size_fn: Rc::new(|| (rand::random::<u64>() % 30 + 1) * MILLISECOND),
@@ -191,7 +194,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         server_error_count: vec![],
     };
     model.init(&config);
-    model.inject_app_retry();
+    // model.inject_app_retry();
 
     let bar = ProgressBar::new(config.max_time / SECOND);
     loop {
@@ -835,10 +838,10 @@ fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::E
                             .map(|x| x.get(server_id).copied().unwrap_or(0) as f32),
                     ),
                     3,
-                    colors[i + cfg.num_servers as usize],
+                    colors[i],
                 ))?
                 .label(format!("server-{}-memory-lock", server_id))
-                .legend(move |(x, y)| Circle::new((x, y), 3, colors[i + cfg.num_servers as usize]));
+                .legend(move |(x, y)| Circle::new((x, y), 3, colors[i]));
         }
         chart
             .configure_series_labels()
@@ -1191,6 +1194,7 @@ impl Model {
                     10 * MILLISECOND,
                     client.id,
                     region_id,
+                    false,
                 );
                 client.on_req(req);
             }),
@@ -1208,6 +1212,7 @@ impl Model {
                     10 * MILLISECOND,
                     client.id,
                     region_id,
+                    false,
                 );
                 client.on_req(req);
             }),
@@ -1224,7 +1229,7 @@ impl Model {
             }),
         ));
         self.events.borrow_mut().push(Event::new(
-            800 * SECOND,
+            600 * SECOND,
             EventType::Injection,
             Box::new(move |model| {
                 model.app.retry = false;
@@ -1666,7 +1671,13 @@ impl Server {
         }
     }
 
-    fn on_req(&mut self, task: Request) {
+    fn on_req(&mut self, mut task: Request) {
+        task.trace.record(format!(
+            "{}: server-{}, recv req {}",
+            now().pretty_print(),
+            self.server_id,
+            task.req_id
+        ));
         match task.req_type {
             EventType::ReadRequest => {
                 *self.read_req_count.entry(task.selector_state).or_insert(0) += 1;
@@ -2100,10 +2111,9 @@ impl Client {
     // app sends a req to client
     fn on_req(&mut self, mut req: Request) {
         req.client_id = self.id;
-        req.trace.messages.push(format!(
-            "{}: client {}-{} received req {}",
+        req.trace.record(format!(
+            "{}: client {}, received req {}",
             now().pretty_print(),
-            self.zone,
             self.id,
             req.req_id,
         ));
@@ -2113,10 +2123,9 @@ impl Client {
 
     // send the req to the appropriate peer. If all peers have been tried, return error to app.
     fn issue_request(&mut self, mut req: Request, selector: Rc<RefCell<PeerSelector>>) {
-        req.trace.messages.push(format!(
-            "{}: client {}-{} issued req {}, selector_state {}",
+        req.trace.record(format!(
+            "{}: client {}, issued req {}, selector_state {}",
             now().pretty_print(),
-            self.zone,
             self.id,
             req.req_id,
             selector.borrow().state,
@@ -2141,6 +2150,13 @@ impl Client {
                 req.selector_state = selector.state;
                 let server = selector.next(&mut model.servers, &mut req);
                 if let Some(server) = server {
+                    req.trace.record(format!(
+                        "{}: client {}, sending req {} to server {}",
+                        now().pretty_print(),
+                        this_client_id,
+                        req.req_id,
+                        server.server_id,
+                    ));
                     server.on_req(req);
                 } else {
                     // no server available, return error
@@ -2179,10 +2195,9 @@ impl Client {
                             this.max_execution_time.pretty_print()
                         );
 
-                        req_clone.trace.messages.push(format!(
-                            "{}: client {}-{}, max execution time exceeded for req {}",
+                        req_clone.trace.record(format!(
+                            "{}: client {}, max execution time exceeded for req {}",
                             now().pretty_print(),
-                            this.zone,
                             this.id,
                             req_id,
                         ));
@@ -2212,10 +2227,9 @@ impl Client {
         self.latency_stat.record(now() - start_time).unwrap();
 
         if let Some(e) = error {
-            req.trace.messages.push(format!(
-                "{}: client {}-{} received error {} for req {}",
+            req.trace.record(format!(
+                "{}: client {}, received error {} for req {}",
                 now().pretty_print(),
-                self.zone,
                 self.id,
                 e,
                 req.req_id,
@@ -2228,10 +2242,9 @@ impl Client {
             // retry other peers
             self.issue_request(req, selector.clone());
         } else {
-            req.trace.messages.push(format!(
-                "{}: client {}-{} received success for req {}",
+            req.trace.record(format!(
+                "{}: client {}, received success for req {}",
                 now().pretty_print(),
-                self.zone,
                 self.id,
                 req.req_id,
             ));
@@ -2274,6 +2287,7 @@ struct App {
     num_queries_fn: Rc<dyn Fn() -> u64>,
     read_only_ratio: f64,
     retry: bool,
+    enable_trace: bool,
 
     // metrics
     txn_duration_stat: Histogram<Time>,
@@ -2290,16 +2304,48 @@ enum CommitPhase {
     ReadOnly,
 }
 
-#[derive(Default)]
-struct TransactionTrace {
-    messages: Vec<String>,
+enum TransactionTrace {
+    Enabled(Vec<String>),
+    Disabled,
 }
 
 impl TransactionTrace {
+    fn new(enabled: bool) -> Self {
+        if enabled {
+            Self::Enabled(Vec::new())
+        } else {
+            Self::Disabled
+        }
+    }
+
+    fn record(&mut self, msg: String) {
+        match self {
+            Self::Enabled(messages) => {
+                messages.push(msg);
+            }
+            Self::Disabled => {}
+        }
+    }
+
+    fn extend(&mut self, msgs: Vec<String>) {
+        match self {
+            Self::Enabled(messages) => {
+                messages.extend(msgs);
+            }
+            Self::Disabled => {}
+        }
+    }
+
     #[allow(unused)]
     fn dump(&self) {
-        for msg in &self.messages {
-            println!("{}", msg);
+        match self {
+            Self::Enabled(messages) => {
+                println!("===== transaction trace =====");
+                for msg in messages {
+                    println!("{}", msg);
+                }
+            }
+            Self::Disabled => {}
         }
     }
 }
@@ -2329,6 +2375,7 @@ impl Transaction {
         read_size_fn: Rc<dyn Fn() -> Time>,
         prewrite_size_fn: Rc<dyn Fn() -> Time>,
         commit_size_fn: Rc<dyn Fn() -> Time>,
+        enable_trace: bool,
     ) -> Self {
         assert!(read_staleness.is_none() || read_only);
         // we assume at least 1 query.
@@ -2344,6 +2391,7 @@ impl Transaction {
                 read_size_fn(),
                 u64::MAX,
                 rand::random::<u64>() % num_region,
+                enable_trace,
             ));
         }
         let (mut prewrite_req, mut commit_req) = (None, None);
@@ -2356,6 +2404,7 @@ impl Transaction {
                 prewrite_size_fn(),
                 u64::MAX,
                 write_region,
+                enable_trace,
             ));
             commit_req = Some(Request::new(
                 start_ts,
@@ -2364,12 +2413,13 @@ impl Transaction {
                 commit_size_fn(),
                 u64::MAX,
                 write_region,
+                enable_trace,
             ));
         }
 
-        let trace = Rc::new(RefCell::new(TransactionTrace::default()));
-        trace.borrow_mut().messages.push(format!(
-            "{}: txn created with start_ts {}",
+        let trace = Rc::new(RefCell::new(TransactionTrace::new(enable_trace)));
+        trace.borrow_mut().record(format!(
+            "{}: app, txn created with start_ts {}",
             now().pretty_print(),
             start_ts.pretty_print()
         ));
@@ -2412,6 +2462,7 @@ impl App {
             num_queries_fn: cfg.app_config.num_queries_fn.clone(),
             read_only_ratio: cfg.app_config.read_only_ratio,
             retry: cfg.app_config.retry,
+            enable_trace: cfg.enable_trace,
         }
     }
 
@@ -2426,6 +2477,7 @@ impl App {
             self.read_size_fn.clone(),
             self.prewrite_size_fn.clone(),
             self.commit_size_fn.clone(),
+            self.enable_trace,
         );
         let zone = txn.zone;
         let req = txn.remaining_queries.pop_front().unwrap();
@@ -2459,33 +2511,41 @@ impl App {
             return;
         }
         let txn = txn.unwrap();
-        txn.trace
-            .borrow_mut()
-            .messages
-            .extend(req.trace.messages.drain(..));
+        txn.trace.borrow_mut().extend(req.trace.drain());
 
         if let Some(error) = error {
             if self.retry {
                 // application retry immediately
-                txn.trace.borrow_mut().messages.push(format!(
-                    "retrying from app side, now {}, error: {}",
+                txn.trace.borrow_mut().record(format!(
+                    "{}: app, retrying from app side, error: {}",
                     now().pretty_print(),
                     error
                 ));
                 self.retry_count += 1;
                 let zone = txn.zone;
                 let trace = txn.trace.clone();
-                trace
-                    .borrow_mut()
-                    .messages
-                    .extend(req.trace.messages.drain(..));
-                req.req_id = TASK_COUNTER.fetch_add(1, atomic::Ordering::SeqCst);
-                self.issue_request(zone, req, trace);
+                let retry_req = Request::new(
+                    req.start_ts,
+                    req.stale_read_ts,
+                    req.req_type,
+                    req.size,
+                    req.client_id,
+                    req.region_id,
+                    self.enable_trace,
+                );
+                trace.borrow_mut().record(format!(
+                    "{}: app, retrying req {}-{} with new req {}",
+                    now().pretty_print(),
+                    req.req_type,
+                    req.req_id,
+                    retry_req.req_id
+                ));
+                self.issue_request(zone, retry_req, trace);
             } else {
                 // application doesn't retry
                 let txn = self.pending_transactions.remove(&req.start_ts).unwrap();
-                txn.trace.borrow_mut().messages.push(format!(
-                    "txn failed, now {}, error: {}",
+                txn.trace.borrow_mut().record(format!(
+                    "{}: app, txn failed, error: {}",
                     now().pretty_print(),
                     error
                 ));
@@ -2497,8 +2557,8 @@ impl App {
             }
         } else {
             // success
-            txn.trace.borrow_mut().messages.push(format!(
-                "{}: received ok response for req {}",
+            txn.trace.borrow_mut().record(format!(
+                "{}: app, received ok response for req {}",
                 now().pretty_print(),
                 req.req_id,
             ));
@@ -2514,7 +2574,8 @@ impl App {
                     } else {
                         txn.commit_phase = CommitPhase::Committed;
                         self.txn_duration_stat.record(now() - txn.start_ts).unwrap();
-                        self.pending_transactions.remove(&req.start_ts);
+                        let txn = self.pending_transactions.remove(&req.start_ts).unwrap();
+                        txn.trace.borrow().dump();
                     }
                 }
                 CommitPhase::NotYet => {
@@ -2544,7 +2605,8 @@ impl App {
                 CommitPhase::Committing => {
                     txn.commit_phase = CommitPhase::Committed;
                     self.txn_duration_stat.record(now() - txn.start_ts).unwrap();
-                    self.pending_transactions.remove(&req.start_ts);
+                    let txn = self.pending_transactions.remove(&req.start_ts).unwrap();
+                    txn.trace.borrow().dump();
                 }
                 CommitPhase::Committed => {
                     unreachable!();
@@ -2554,8 +2616,8 @@ impl App {
     }
 
     fn issue_request(&mut self, zone: Zone, req: Request, trace: Rc<RefCell<TransactionTrace>>) {
-        trace.borrow_mut().messages.push(format!(
-            "{}: sending req {}-{} to zone {}",
+        trace.borrow_mut().record(format!(
+            "{}: app, sending req {}-{} to zone {}",
             now().pretty_print(),
             req.req_type,
             req.req_id,
@@ -2571,9 +2633,36 @@ impl App {
     }
 }
 
-#[derive(Clone, Default)]
-struct RequestTrace {
-    messages: Vec<String>,
+#[derive(Clone)]
+enum RequestTrace {
+    Enabled(Vec<String>),
+    Disabled,
+}
+
+impl RequestTrace {
+    fn new(enabled: bool) -> Self {
+        if enabled {
+            Self::Enabled(Vec::new())
+        } else {
+            Self::Disabled
+        }
+    }
+
+    fn record(&mut self, msg: String) {
+        match self {
+            Self::Enabled(messages) => {
+                messages.push(msg);
+            }
+            Self::Disabled => {}
+        }
+    }
+
+    fn drain(&mut self) -> Vec<String> {
+        match self {
+            Self::Enabled(messages) => messages.drain(..).collect(),
+            Self::Disabled => Vec::new(),
+        }
+    }
 }
 
 // a request, its content are permanent and immutable, even if it's sent to multiple servers.
@@ -2601,8 +2690,16 @@ impl Request {
         size: Time,
         client_id: u64,
         region: u64,
+        enable_trace: bool,
     ) -> Self {
         let req_id = TASK_COUNTER.fetch_add(1, atomic::Ordering::SeqCst);
+        let mut trace = RequestTrace::new(enable_trace);
+        trace.record(format!(
+            "{}: req {}-{} created",
+            now().pretty_print(),
+            req_type,
+            req_id,
+        ));
         Self {
             start_ts,
             stale_read_ts,
@@ -2612,14 +2709,7 @@ impl Request {
             size,
             region_id: region,
             selector_state: PeerSelectorState::Unknown,
-            trace: RequestTrace {
-                messages: vec![format!(
-                    "{}: req {}-{} created",
-                    now().pretty_print(),
-                    req_type,
-                    req_id,
-                )],
-            },
+            trace,
         }
     }
 }
