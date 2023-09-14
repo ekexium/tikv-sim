@@ -109,7 +109,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let events: Rc<RefCell<EventHeap>> = Rc::new(RefCell::new(EventHeap::new()));
     let config = Config {
         num_replica: 3,
-        num_region: 10002,
+        num_region: 10000,
         num_servers: 3,
         max_time: 500 * SECOND,
         metrics_interval: SECOND,
@@ -117,7 +117,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         server_config: ServerConfig {
             enable_async_commit: true,
             num_read_workers: 1,
-            num_write_workers: 1,
+            num_write_workers: 10,
             read_timeout: SECOND,
             advance_interval: 5 * SECOND,
             broadcast_interval: 5 * SECOND,
@@ -127,13 +127,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         app_config: AppConfig {
             retry: false,
-            txn_rate: 350.0,
+            txn_rate: 300.0,
             read_staleness: Some(12 * SECOND),
             read_size_fn: Rc::new(|| (rand::random::<u64>() % 5 + 1) * MILLISECOND),
             prewrite_size_fn: Rc::new(|| (rand::random::<u64>() % 30 + 1) * MILLISECOND),
             commit_size_fn: Rc::new(|| (rand::random::<u64>() % 20 + 1) * MILLISECOND),
             num_queries_fn: Rc::new(|| 5),
-            read_only_ratio: 0.95,
+            read_only_ratio: 1.0,
         },
     };
     assert_eq!(config.metrics_interval, SECOND, "why bother");
@@ -170,7 +170,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         server_error_count: vec![],
     };
     model.init(&config);
-    model.inject_app_retry();
+    model.inject_io_delay();
 
     let bar = ProgressBar::new(config.max_time / SECOND);
     loop {
@@ -198,7 +198,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
     use plotters::prelude::*;
-    let num_graphs = 15usize + 2 * 3/* num_server*/;
+    let num_graphs = 16usize + 2 * 3/* num_server*/;
     let root = SVGBackend::new("0.svg", (1200, num_graphs as u32 * 300)).into_drawing_area();
     let children_area = root.split_evenly(((num_graphs + 1) / 2, 2));
     let xs = (0..=model.app_ok_transaction_durations.len()).map(|i| i as f32);
@@ -1178,6 +1178,50 @@ fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::E
             .draw()?;
     }
 
+    // server_rest_time_to_handle_read
+    {
+        let metrics = METRICS
+            .get_hist_group("server_rest_time_to_handle_read")
+            .expect("no stats in server rest time to handle read");
+        let (y_label, y_unit) = ("ms", MILLISECOND);
+
+        chart_id += 1;
+        let mut chart = ChartBuilder::on(&children_area[chart_id])
+            .caption("server rest time to handle read", font.clone())
+            .margin(30)
+            .x_label_area_size(30)
+            .y_label_area_size(30)
+            .set_label_area_size(LabelAreaPosition::Left, 60)
+            .build_cartesian_2d(
+                0f32..metrics.max_time() as f32,
+                0f32..metrics.max_value() as f32 * 1.2 / y_unit as f32,
+            )?;
+
+        chart
+            .configure_mesh()
+            .disable_mesh()
+            .y_label_formatter(&|x| format!("{:.1}{}", x, y_label))
+            .draw()?;
+
+        for (i, (name, points)) in metrics.data_point_series().iter().enumerate() {
+            chart
+                .draw_series(LineSeries::new(
+                    points
+                        .iter()
+                        .map(|(x, y)| (*x as f32, *y as f32 / y_unit as f32)),
+                    colors[i],
+                ))?
+                .label(name.to_string())
+                .legend(move |(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], colors[i]));
+        }
+
+        chart
+            .configure_series_labels()
+            .position(SeriesLabelPosition::UpperLeft)
+            .background_style(WHITE.mix(0.5))
+            .draw()?;
+    }
+
     root.present()?;
     Ok(())
 }
@@ -1279,6 +1323,23 @@ impl Model {
             EventType::Injection,
             Box::new(move |model| {
                 model.app.retry = false;
+            }),
+        ));
+    }
+
+    fn inject_io_delay(&mut self) {
+        self.events.borrow_mut().push(Event::new(
+            100 * SECOND,
+            EventType::Injection,
+            Box::new(move |model| {
+                model.servers[0].read_delay = SECOND;
+            }),
+        ));
+        self.events.borrow_mut().push(Event::new(
+            110 * SECOND,
+            EventType::Injection,
+            Box::new(move |model| {
+                model.servers[0].read_delay = 0;
             }),
         ));
     }
@@ -1681,6 +1742,7 @@ struct Server {
     // a read request will abort at this time if it cannot finish in time
     read_timeout: Time,
     enable_async_commit: bool,
+    read_delay: Time,
 
     // metrics
     error_count: HashMap<Error, u64>,
@@ -1708,6 +1770,7 @@ impl Server {
             concurrency_manager: Default::default(),
             read_timeout: cfg.server_config.read_timeout,
             enable_async_commit: cfg.server_config.enable_async_commit,
+            read_delay: 0,
             write_schedule_wait_stat: new_hist(),
             read_worker_time: 0,
             write_worker_time: 0,
@@ -1767,7 +1830,7 @@ impl Server {
 
         let peer = self.peers.get_mut(&req.region_id).unwrap();
 
-        let task_size = req.size;
+        let task_size = req.size + self.read_delay;
         let stale_read_ts = req.stale_read_ts;
         let is_retry = req.selector_state.is_retry();
         self.read_workers[worker_id] = Some((now(), req));
@@ -1797,6 +1860,13 @@ impl Server {
                 return;
             }
         }
+
+        // When the req gets out of the queue, how much time do I have to handle it before it times out?
+        METRICS.record_hist(
+            "server_rest_time_to_handle_read",
+            vec![this_server_id.to_string()],
+            (accept_time + self.read_timeout).saturating_sub(now()),
+        );
 
         // timeout check
         if !is_retry && accept_time + self.read_timeout < now() + task_size {
