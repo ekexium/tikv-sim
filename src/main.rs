@@ -170,7 +170,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         server_error_count: vec![],
     };
     model.init(&config);
-    // model.inject_app_retry();
+    model.inject_app_retry();
 
     let bar = ProgressBar::new(config.max_time / SECOND);
     loop {
@@ -261,7 +261,9 @@ fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::E
     {
         chart_id += 1;
         let (y_unit, y_label) = (MILLISECOND, "ms");
-        let metrics = METRICS.get_by_name("app_ok_txn_duration");
+        let metrics = METRICS
+            .get_hist_group("app_ok_txn_duration")
+            .expect("no app ok records");
 
         let mut chart = ChartBuilder::on(&children_area[chart_id])
             .caption("successful txn latency", font.clone())
@@ -280,43 +282,55 @@ fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::E
             .draw()?;
 
         // mean latency
-        for (i, (key, series)) in metrics.0.iter().enumerate() {
+        for (i, (name, points)) in metrics.data_point_series().iter().enumerate() {
             chart
                 .draw_series(LineSeries::new(
-                    (0..series.len()).map(|t| {
-                        (
-                            t as f32,
-                            series
-                                .get(&(t as Time))
-                                .map(|hist| hist.mean() as f32 / y_unit as f32)
-                                .unwrap_or(0.0),
-                        )
-                    }),
+                    points
+                        .iter()
+                        .map(|(x, y)| (*x as f32, *y as f32 / y_unit as f32)),
                     colors[i],
                 ))?
-                .label(key.to_string() + "-mean")
+                .label(name)
                 .legend(move |(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], colors[i]));
         }
 
+        // for (i, (key, series)) in metrics.0.iter().enumerate() {
+        //     chart
+        //         .draw_series(LineSeries::new(
+        //             (0..series.len()).map(|t| {
+        //                 (
+        //                     t as f32,
+        //                     series
+        //                         .get(&(t as Time))
+        //                         .map(|hist| hist.mean() as f32 / y_unit as f32)
+        //                         .unwrap_or(0.0),
+        //                 )
+        //             }),
+        //             colors[i],
+        //         ))?
+        //         .label(key.to_string() + "-mean")
+        //         .legend(move |(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], colors[i]));
+        // }
+
         // p99 latency
-        for (i, (key, series)) in metrics.0.iter().enumerate() {
-            chart
-                .draw_series(PointSeries::<(f32, f32), _, Circle<_, _>, f32>::new(
-                    (0..series.len()).map(|t| {
-                        (
-                            t as f32,
-                            series
-                                .get(&(t as Time))
-                                .map(|hist| hist.value_at_quantile(0.99) as f32 / y_unit as f32)
-                                .unwrap_or(0.0),
-                        )
-                    }),
-                    3f32,
-                    colors[i],
-                ))?
-                .label(key.to_string() + "-p99")
-                .legend(move |(x, y)| Circle::new((x, y), 3f32, colors[i]));
-        }
+        // for (i, (key, series)) in metrics.0.iter().enumerate() {
+        //     chart
+        //         .draw_series(PointSeries::<(f32, f32), _, Circle<_, _>, f32>::new(
+        //             (0..series.len()).map(|t| {
+        //                 (
+        //                     t as f32,
+        //                     series
+        //                         .get(&(t as Time))
+        //                         .map(|hist| hist.value_at_quantile(0.99) as f32 / y_unit as f32)
+        //                         .unwrap_or(0.0),
+        //                 )
+        //             }),
+        //             3f32,
+        //             colors[i],
+        //         ))?
+        //         .label(key.to_string() + "-p99")
+        //         .legend(move |(x, y)| Circle::new((x, y), 3f32, colors[i]));
+        // }
 
         // legend
         chart
@@ -1120,8 +1134,9 @@ fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::E
     // read schedule wait stat
     {
         chart_id += 1;
-        let metrics = METRICS.get_by_name("server_read_schedule_wait");
-        let max_x = metrics.max_time().max(1);
+        let metrics = METRICS
+            .get_hist_group("server_read_schedule_wait")
+            .expect("no stats in server read schedule wait");
         let (y_label, y_unit) = ("ms", MILLISECOND);
 
         let mut chart = ChartBuilder::on(&children_area[chart_id])
@@ -1131,8 +1146,8 @@ fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::E
             .y_label_area_size(30)
             .set_label_area_size(LabelAreaPosition::Left, 60)
             .build_cartesian_2d(
-                0f32..(max_x + 1) as f32,
-                0f32..metrics.max_value().max(1) as f32 * 1.2 / y_unit as f32,
+                0f32..metrics.max_time() as f32,
+                0f32..metrics.max_value() as f32 * 1.2 / y_unit as f32,
             )?;
 
         chart
@@ -1142,43 +1157,19 @@ fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::E
             .draw()?;
 
         // mean latency
-        for (i, (key, series)) in metrics.0.iter().enumerate() {
+        for (i, (name, points)) in metrics.data_point_series().iter().enumerate() {
             chart
                 .draw_series(LineSeries::new(
-                    (0..max_x).map(|t| {
-                        (
-                            t as f32,
-                            series
-                                .get(&(t as u64))
-                                .map(|hist| hist.mean() as f32 / y_unit as f32)
-                                .unwrap_or(0.0),
-                        )
-                    }),
+                    points
+                        .iter()
+                        .map(|(x, y)| (*x as f32, *y as f32 / y_unit as f32)),
                     colors[i],
                 ))?
-                .label(key.to_string())
+                .label(name.to_string())
                 .legend(move |(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], colors[i]));
         }
 
-        // p99 latency
-        for (i, (key, series)) in metrics.0.iter().enumerate() {
-            chart
-                .draw_series(PointSeries::<(f32, f32), _, Circle<_, _>, f32>::new(
-                    (0..max_x).map(|t| {
-                        (
-                            t as f32,
-                            series
-                                .get(&(t as u64))
-                                .map(|hist| hist.value_at_quantile(0.99) as f32 / y_unit as f32)
-                                .unwrap_or(0.0),
-                        )
-                    }),
-                    3f32,
-                    colors[i],
-                ))?
-                .label(key.to_string() + "-p99")
-                .legend(move |(x, y)| Circle::new((x, y), 3f32, colors[i]));
-        }
+        // TODO: p99 latency
 
         chart
             .configure_series_labels()
@@ -1417,7 +1408,7 @@ impl Model {
             for client in &mut self.clients {
                 for (req_type, stat) in &mut client.success_latency_stat {
                     map.entry(*req_type)
-                        .or_insert_with(|| new_hist())
+                        .or_insert_with(new_hist)
                         .add(stat.clone())
                         .unwrap();
                     stat.reset()
@@ -1431,7 +1422,7 @@ impl Model {
             for client in &mut self.clients {
                 for (error, stat) in &mut client.error_latency_stat {
                     map.entry(*error)
-                        .or_insert_with(|| new_hist())
+                        .or_insert_with(new_hist)
                         .add(stat.clone())
                         .unwrap();
                     stat.reset();
@@ -1765,7 +1756,7 @@ impl Server {
     // Invariant: the worker is idle.
     fn handle_read(&mut self, worker_id: usize, req: Request, accept_time: Time) {
         assert!(self.read_workers[worker_id].is_none());
-        METRICS.record(
+        METRICS.record_hist(
             "server_read_schedule_wait",
             vec![self.server_id.to_string()],
             now() - accept_time,
@@ -2243,7 +2234,7 @@ impl Client {
                     if let Some((start_time, _)) = this.pending_tasks.remove(&req_id) {
                         this.error_latency_stat
                             .entry(Error::MaxExecutionTimeExceeded)
-                            .or_insert_with(|| new_hist())
+                            .or_insert_with(new_hist)
                             .record(now() - start_time)
                             .unwrap();
                         assert_eq!(
@@ -2296,7 +2287,7 @@ impl Client {
             ));
             self.error_latency_stat
                 .entry(e)
-                .or_insert_with(|| new_hist())
+                .or_insert_with(new_hist)
                 .record(now() - start_time)
                 .unwrap();
             // retry other peers
@@ -2310,7 +2301,7 @@ impl Client {
             ));
             self.success_latency_stat
                 .entry(req.req_type)
-                .or_insert_with(|| new_hist())
+                .or_insert_with(new_hist)
                 .record(now() - start_time)
                 .unwrap();
             // success. respond to app
@@ -2337,7 +2328,6 @@ struct App {
     pending_transactions: HashMap<Time, Transaction>,
     read_staleness: Option<Time>,
     num_region: u64,
-    retry_count: u64,
     stop: bool,
 
     // configs
@@ -2515,7 +2505,6 @@ impl App {
             failed_txn_stat: HashMap::new(),
             read_staleness: cfg.app_config.read_staleness,
             num_region: cfg.num_region,
-            retry_count: 0,
             read_size_fn: cfg.app_config.read_size_fn.clone(),
             prewrite_size_fn: cfg.app_config.prewrite_size_fn.clone(),
             commit_size_fn: cfg.app_config.commit_size_fn.clone(),
@@ -2581,8 +2570,8 @@ impl App {
                     now().pretty_print(),
                     error
                 ));
-                self.retry_count += 1;
                 let zone = txn.zone;
+                METRICS.inc_counter("app_retry", vec![zone.to_string()], 1);
                 let trace = txn.trace.clone();
                 let retry_req = Request::new(
                     req.start_ts,
@@ -2611,7 +2600,7 @@ impl App {
                 ));
                 self.failed_txn_stat
                     .entry(error)
-                    .or_insert_with(|| new_hist())
+                    .or_insert_with(new_hist)
                     .record(now() - txn.start_ts)
                     .unwrap();
             }
@@ -2633,7 +2622,7 @@ impl App {
                         self.issue_request(zone, req, trace);
                     } else {
                         txn.commit_phase = CommitPhase::Committed;
-                        METRICS.record(
+                        METRICS.record_hist(
                             "app_ok_txn_duration",
                             vec![txn.zone.to_string()],
                             now() - txn.start_ts,
@@ -2669,7 +2658,7 @@ impl App {
                 }
                 CommitPhase::Committing => {
                     txn.commit_phase = CommitPhase::Committed;
-                    METRICS.record(
+                    METRICS.record_hist(
                         "app_ok_txn_duration",
                         vec![txn.zone.to_string()],
                         now() - txn.start_ts,
@@ -2729,7 +2718,7 @@ impl RequestTrace {
 
     fn drain(&mut self) -> Vec<String> {
         match self {
-            Self::Enabled(messages) => messages.drain(..).collect(),
+            Self::Enabled(messages) => std::mem::take(messages),
             Self::Disabled => Vec::new(),
         }
     }
