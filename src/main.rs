@@ -14,42 +14,22 @@ use rand::prelude::IteratorRandom;
 use rand::rngs::{OsRng, StdRng};
 use rand::{Rng, SeedableRng};
 use rand_distr::{Distribution, Exp, LogNormal};
+use tikv_sim::TimeTrait;
+use tikv_sim::{Time, *};
 
 #[global_allocator]
 static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
+lazy_static! {
+    static ref METRICS: MetricsRecorder = MetricsRecorder::new();
+}
+
 type Events = Rc<RefCell<EventHeap>>;
-
-type Time = u64;
-
-trait TimeTrait {
-    fn pretty_print(&self) -> String;
-}
-
-impl TimeTrait for Time {
-    fn pretty_print(&self) -> String {
-        if *self < MICROSECOND {
-            format!("{} ns", self)
-        } else if *self < MILLISECOND {
-            format!("{:.2} us", *self as f64 / MICROSECOND as f64)
-        } else if *self < SECOND {
-            format!("{:.2} ms", *self as f64 / MILLISECOND as f64)
-        } else {
-            format!("{:.2} s", *self as f64 / SECOND as f64)
-        }
-    }
-}
-
-const NANOSECOND: Time = 1;
-const MICROSECOND: Time = 1_000 * NANOSECOND;
-const MILLISECOND: Time = 1_000 * MICROSECOND;
-const SECOND: Time = 1_000 * MILLISECOND;
 
 static TASK_COUNTER: AtomicU64 = AtomicU64::new(0);
 static EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
 static SERVER_COUNTER: AtomicU64 = AtomicU64::new(0);
 static CLIENT_COUNTER: AtomicU64 = AtomicU64::new(0);
-static CURRENT_TIME: AtomicU64 = AtomicU64::new(0);
 
 // https://aws.amazon.com/blogs/architecture/improving-performance-and-reducing-cost-using-availability-zone-affinity/
 // https://www.xkyle.com/Measuring-AWS-Region-and-AZ-Latency/
@@ -68,10 +48,6 @@ lazy_static! {
         let scale = (1.0 + std_dev.powi(2) / mean.powi(2)).ln().sqrt();
         LogNormal::new(location, scale).unwrap()
     };
-}
-
-fn now() -> Time {
-    CURRENT_TIME.load(atomic::Ordering::SeqCst)
 }
 
 fn rpc_latency(remote: bool) -> u64 {
@@ -222,7 +198,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
     use plotters::prelude::*;
-    let num_graphs = 14usize + 2 * 3/* num_server*/;
+    let num_graphs = 15usize + 2 * 3/* num_server*/;
     let root = SVGBackend::new("0.svg", (1200, num_graphs as u32 * 300)).into_drawing_area();
     let children_area = root.split_evenly(((num_graphs + 1) / 2, 2));
     let xs = (0..=model.app_ok_transaction_durations.len()).map(|i| i as f32);
@@ -285,21 +261,16 @@ fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::E
     {
         chart_id += 1;
         let (y_unit, y_label) = (MILLISECOND, "ms");
+        let metrics = METRICS.get_by_name("app_ok_txn_duration");
+
         let mut chart = ChartBuilder::on(&children_area[chart_id])
             .caption("successful txn latency", font.clone())
             .margin(30)
             .x_label_area_size(30)
             .y_label_area_size(30)
             .build_cartesian_2d(
-                0f32..model.app_ok_transaction_durations.len() as f32,
-                0f32..(model
-                    .app_ok_transaction_durations
-                    .iter()
-                    .map(|x| x.max())
-                    .max()
-                    .unwrap()
-                    / y_unit) as f32
-                    * 1.2,
+                0f32..metrics.max_time() as f32,
+                0f32..(metrics.max_value() as f32 / y_unit as f32) * 1.2,
             )?;
 
         chart
@@ -307,32 +278,46 @@ fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::E
             .disable_mesh()
             .y_label_formatter(&|x| format!("{:.1}{}", x, y_label))
             .draw()?;
+
         // mean latency
-        chart
-            .draw_series(LineSeries::new(
-                xs.clone().zip(
-                    model
-                        .app_ok_transaction_durations
-                        .iter()
-                        .map(|x| (x.mean() / y_unit as f64) as f32),
-                ),
-                &colors[0],
-            ))?
-            .label("mean")
-            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], colors[0]));
+        for (i, (key, series)) in metrics.0.iter().enumerate() {
+            chart
+                .draw_series(LineSeries::new(
+                    (0..series.len()).map(|t| {
+                        (
+                            t as f32,
+                            series
+                                .get(&(t as Time))
+                                .map(|hist| hist.mean() as f32 / y_unit as f32)
+                                .unwrap_or(0.0),
+                        )
+                    }),
+                    colors[i],
+                ))?
+                .label(key.to_string() + "-mean")
+                .legend(move |(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], colors[i]));
+        }
+
         // p99 latency
-        chart
-            .draw_series(LineSeries::new(
-                xs.clone().zip(
-                    model
-                        .app_ok_transaction_durations
-                        .iter()
-                        .map(|x| (x.value_at_quantile(0.99) / y_unit) as f32),
-                ),
-                &colors[1],
-            ))?
-            .label("p99")
-            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], colors[1]));
+        for (i, (key, series)) in metrics.0.iter().enumerate() {
+            chart
+                .draw_series(PointSeries::<(f32, f32), _, Circle<_, _>, f32>::new(
+                    (0..series.len()).map(|t| {
+                        (
+                            t as f32,
+                            series
+                                .get(&(t as Time))
+                                .map(|hist| hist.value_at_quantile(0.99) as f32 / y_unit as f32)
+                                .unwrap_or(0.0),
+                        )
+                    }),
+                    3f32,
+                    colors[i],
+                ))?
+                .label(key.to_string() + "-p99")
+                .legend(move |(x, y)| Circle::new((x, y), 3f32, colors[i]));
+        }
+
         // legend
         chart
             .configure_series_labels()
@@ -1132,6 +1117,76 @@ fn draw_metrics(model: &Model, cfg: &Config) -> Result<(), Box<dyn std::error::E
         }
     }
 
+    // read schedule wait stat
+    {
+        chart_id += 1;
+        let metrics = METRICS.get_by_name("server_read_schedule_wait");
+        let max_x = metrics.max_time().max(1);
+        let (y_label, y_unit) = ("ms", MILLISECOND);
+
+        let mut chart = ChartBuilder::on(&children_area[chart_id])
+            .caption("read schedule wait stat", font.clone())
+            .margin(30)
+            .x_label_area_size(30)
+            .y_label_area_size(30)
+            .set_label_area_size(LabelAreaPosition::Left, 60)
+            .build_cartesian_2d(
+                0f32..(max_x + 1) as f32,
+                0f32..metrics.max_value().max(1) as f32 * 1.2 / y_unit as f32,
+            )?;
+
+        chart
+            .configure_mesh()
+            .disable_mesh()
+            .y_label_formatter(&|x| format!("{:.1}{}", x, y_label))
+            .draw()?;
+
+        // mean latency
+        for (i, (key, series)) in metrics.0.iter().enumerate() {
+            chart
+                .draw_series(LineSeries::new(
+                    (0..max_x).map(|t| {
+                        (
+                            t as f32,
+                            series
+                                .get(&(t as u64))
+                                .map(|hist| hist.mean() as f32 / y_unit as f32)
+                                .unwrap_or(0.0),
+                        )
+                    }),
+                    colors[i],
+                ))?
+                .label(key.to_string())
+                .legend(move |(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], colors[i]));
+        }
+
+        // p99 latency
+        for (i, (key, series)) in metrics.0.iter().enumerate() {
+            chart
+                .draw_series(PointSeries::<(f32, f32), _, Circle<_, _>, f32>::new(
+                    (0..max_x).map(|t| {
+                        (
+                            t as f32,
+                            series
+                                .get(&(t as u64))
+                                .map(|hist| hist.value_at_quantile(0.99) as f32 / y_unit as f32)
+                                .unwrap_or(0.0),
+                        )
+                    }),
+                    3f32,
+                    colors[i],
+                ))?
+                .label(key.to_string() + "-p99")
+                .legend(move |(x, y)| Circle::new((x, y), 3f32, colors[i]));
+        }
+
+        chart
+            .configure_series_labels()
+            .position(SeriesLabelPosition::UpperLeft)
+            .background_style(WHITE.mix(0.5))
+            .draw()?;
+    }
+
     root.present()?;
     Ok(())
 }
@@ -1710,6 +1765,11 @@ impl Server {
     // Invariant: the worker is idle.
     fn handle_read(&mut self, worker_id: usize, req: Request, accept_time: Time) {
         assert!(self.read_workers[worker_id].is_none());
+        METRICS.record(
+            "server_read_schedule_wait",
+            vec![self.server_id.to_string()],
+            now() - accept_time,
+        );
         self.read_schedule_wait_stat
             .record(now() - accept_time)
             .unwrap();
@@ -2573,6 +2633,11 @@ impl App {
                         self.issue_request(zone, req, trace);
                     } else {
                         txn.commit_phase = CommitPhase::Committed;
+                        METRICS.record(
+                            "app_ok_txn_duration",
+                            vec![txn.zone.to_string()],
+                            now() - txn.start_ts,
+                        );
                         self.txn_duration_stat.record(now() - txn.start_ts).unwrap();
                         let txn = self.pending_transactions.remove(&req.start_ts).unwrap();
                         txn.trace.borrow().dump();
@@ -2604,6 +2669,11 @@ impl App {
                 }
                 CommitPhase::Committing => {
                     txn.commit_phase = CommitPhase::Committed;
+                    METRICS.record(
+                        "app_ok_txn_duration",
+                        vec![txn.zone.to_string()],
+                        now() - txn.start_ts,
+                    );
                     self.txn_duration_stat.record(now() - txn.start_ts).unwrap();
                     let txn = self.pending_transactions.remove(&req.start_ts).unwrap();
                     txn.trace.borrow().dump();
@@ -2848,5 +2918,5 @@ impl Display for Error {
 }
 
 fn new_hist() -> Histogram<Time> {
-    Histogram::<Time>::new_with_bounds(1, 60 * 60 * SECOND, 3).unwrap()
+    Histogram::<Time>::new(3).unwrap()
 }
