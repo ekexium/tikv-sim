@@ -170,7 +170,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         server_error_count: vec![],
     };
     model.init(&config);
-    model.inject_io_delay();
+    model.inject_high_pressure();
 
     let bar = ProgressBar::new(config.max_time / SECOND);
     loop {
@@ -1327,6 +1327,7 @@ impl Model {
         ));
     }
 
+    #[allow(unused)]
     fn inject_io_delay(&mut self) {
         self.events.borrow_mut().push(Event::new(
             100 * SECOND,
@@ -1340,6 +1341,23 @@ impl Model {
             EventType::Injection,
             Box::new(move |model| {
                 model.servers[0].read_delay = 0;
+            }),
+        ));
+    }
+
+    fn inject_high_pressure(&mut self) {
+        self.events.borrow_mut().push(Event::new(
+            100 * SECOND,
+            EventType::Injection,
+            Box::new(move |model| {
+                model.app.txn_interval_adjust_value = -1 * MILLISECOND as i64;
+            }),
+        ));
+        self.events.borrow_mut().push(Event::new(
+            150 * SECOND,
+            EventType::Injection,
+            Box::new(move |model| {
+                model.app.txn_interval_adjust_value = 0;
             }),
         ));
     }
@@ -2398,7 +2416,11 @@ struct App {
     pending_transactions: HashMap<Time, Transaction>,
     read_staleness: Option<Time>,
     num_region: u64,
+
+    // injection
     stop: bool,
+    // add this time to the interval between two transactions
+    txn_interval_adjust_value: i64,
 
     // configs
     read_size_fn: Rc<dyn Fn() -> Time>,
@@ -2582,6 +2604,7 @@ impl App {
             read_only_ratio: cfg.app_config.read_only_ratio,
             retry: cfg.app_config.retry,
             enable_trace: cfg.enable_trace,
+            txn_interval_adjust_value: 0,
         }
     }
 
@@ -2607,8 +2630,11 @@ impl App {
         // Invariant: interval must be > 0, to avoid infinite loop.
         // And to make start_ts unique as start_ts is using now() directly
         let interval = ((self.rate_exp_dist.sample(&mut self.rng) * SECOND as f64) as Time).max(1);
+        let trigger_time = ((now() as i64 + interval as i64)
+            .saturating_add(self.txn_interval_adjust_value) as u64)
+            .max(now() + 1);
         self.events.borrow_mut().push(Event::new(
-            now() + interval,
+            trigger_time,
             EventType::AppGen,
             Box::new(move |model: &mut Model| {
                 if model.app.stop {
