@@ -237,15 +237,13 @@ fn draw_metrics(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
     let hist_count_opts = Opts::Hist(HistOpts::Count);
     let counter_opts = Opts::Counter;
     let gauge_opts = Opts::Gauge;
-
     let (ms_unit, ms_label) = (MILLISECOND, "ms");
-
     let mut chart_id = 0;
+
     let app_ok_txn_duration = M
         .get_metric_group("app_txn_duration")
         .unwrap()
         .filter_by_label(0, "ok");
-
     plot_chart(
         &children_area,
         &font,
@@ -469,8 +467,8 @@ fn draw_metrics(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
         &mut chart_id,
         "max resolved ts gap",
         server_max_resolved_ts_gap,
-        1,
-        "",
+        ms_unit,
+        ms_label,
     )?;
     plot_chart(
         &children_area,
@@ -487,29 +485,29 @@ fn draw_metrics(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
         &children_area,
         &font,
         colors,
-        hist_latency_opts,
+        gauge_opts,
         &mut chart_id,
         "read worker utilization",
         server_reader_utilization,
-        1,
-        "",
+        cfg.metrics_interval / 100,
+        "%",
     )?;
     plot_chart(
         &children_area,
         &font,
         colors,
-        hist_latency_opts,
+        gauge_opts,
         &mut chart_id,
         "write worker utilization",
         server_writer_utilization,
-        1,
-        "",
+        cfg.metrics_interval / 100,
+        "%",
     )?;
     plot_chart(
         &children_area,
         &font,
         colors,
-        hist_count_opts,
+        counter_opts,
         &mut chart_id,
         "read req count",
         server_read_req_count,
@@ -520,7 +518,7 @@ fn draw_metrics(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
         &children_area,
         &font,
         colors,
-        hist_count_opts,
+        counter_opts,
         &mut chart_id,
         "write req count",
         server_write_req_count,
@@ -531,7 +529,7 @@ fn draw_metrics(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
         &children_area,
         &font,
         colors,
-        hist_count_opts,
+        counter_opts,
         &mut chart_id,
         "error count",
         server_error_count,
@@ -587,28 +585,31 @@ fn plot_chart(
     y_unit: Time,
     y_label: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let x_spec = 0f32..metrics.max_time() as f32;
+    let y_spec = metrics.min_value() as f32..(if matches!(opts, Opts::Hist(HistOpts::Count)) {
+        metrics.max_count() as i64
+    } else {
+        metrics.max_value()
+    }) as f32
+        * 1.2
+        / y_unit as f32;
     let mut chart = ChartBuilder::on(&children_area[*chart_id])
         .caption(chart_name, font.clone())
         .margin(30)
         .x_label_area_size(30)
         .y_label_area_size(30)
-        .build_cartesian_2d(
-            0f32..metrics.max_time() as f32,
-            0f32..(if matches!(opts, Opts::Hist(HistOpts::Count)) {
-                metrics.max_count() as i64
-            } else {
-                metrics.max_value()
-            }) as f32
-                * 1.2
-                / y_unit as f32,
-        )?;
+        .build_cartesian_2d(x_spec, y_spec)?;
 
     chart
         .configure_mesh()
         .disable_mesh()
         .y_label_formatter(&|x| format!("{}{}", x, y_label))
         .draw()?;
-    for (i, (name, series)) in metrics.data_point_series(opts).iter().enumerate() {
+
+    let mut data = metrics.data_point_series(opts);
+    data.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+    for (i, (name, series)) in data.iter().enumerate() {
         chart
             .draw_series(LineSeries::new(
                 series

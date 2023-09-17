@@ -479,24 +479,4 @@ impl MetricsRecorder {
         let data = self.data.lock().unwrap();
         data.metric_group.get(name).cloned()
     }
-
-    // sum over all labels of a metric, return the series that is equal to the merge of all series
-    pub fn sum_hist_series_by_name(&self, _name: &str) -> HistogramSeries {
-        todo!();
-        // let mut data = self.data.lock().unwrap();
-        // let mut series = HashMap::new();
-        // for (key, value) in data.0.iter_mut() {
-        //     if key.name == name {
-        //         for (time_bucket, histogram) in value.iter_mut() {
-        //             let sum_histogram = series.entry(*time_bucket).or_insert_with(|| {
-        //                 Histogram::<u64>::new(3).expect("failed to create histogram")
-        //             });
-        //             sum_histogram
-        //                 .add(histogram)
-        //                 .expect("failed to add histogram");
-        //         }
-        //     }
-        // }
-        // series
-    }
 }
