@@ -23,21 +23,21 @@ pub enum MetricGroup {
 }
 
 impl MetricGroup {
-    fn histogram(&mut self) -> &mut HashMap<Label, HistogramSeries> {
+    pub fn histogram(&mut self) -> &mut HashMap<Label, HistogramSeries> {
         match self {
             MetricGroup::Histogram(h) => h,
             _ => panic!("wrong type"),
         }
     }
 
-    fn counter(&mut self) -> &mut HashMap<Label, CounterSeries> {
+    pub fn counter(&mut self) -> &mut HashMap<Label, CounterSeries> {
         match self {
             MetricGroup::Counter(c) => c,
             _ => panic!("wrong type"),
         }
     }
 
-    fn gauge(&mut self) -> &mut HashMap<Label, GaugeSeries> {
+    pub fn gauge(&mut self) -> &mut HashMap<Label, GaugeSeries> {
         match self {
             MetricGroup::Gauge(g) => g,
             _ => panic!("wrong type"),
@@ -258,10 +258,7 @@ impl MetricsRecorder {
             .metric_group
             .entry(name.to_owned())
             .or_insert_with(|| MetricGroup::Histogram(HashMap::new()));
-        let series = group
-            .histogram()
-            .entry(label)
-            .or_default();
+        let series = group.histogram().entry(label).or_default();
         let histogram = series
             .entry(bucket)
             .or_insert_with(|| Histogram::<u64>::new(3).expect("failed to create histogram"));
@@ -277,10 +274,7 @@ impl MetricsRecorder {
             .metric_group
             .entry(name.to_owned())
             .or_insert_with(|| MetricGroup::Counter(HashMap::new()));
-        let series = group
-            .counter()
-            .entry(label)
-            .or_default();
+        let series = group.counter().entry(label).or_default();
         let counter = series.entry(bucket).or_insert(0);
         *counter += delta;
     }
