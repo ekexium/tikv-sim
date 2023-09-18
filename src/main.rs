@@ -242,6 +242,7 @@ fn draw_metrics(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
 
     let app_gen_txn_counter = M.get_metric_group("app_gen_txn_counter").unwrap();
     plot_chart(
+        &cfg,
         &children_area,
         &font,
         colors,
@@ -258,6 +259,7 @@ fn draw_metrics(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
         .unwrap()
         .filter_by_label(0, "ok");
     plot_chart(
+        &cfg,
         &children_area,
         &font,
         colors,
@@ -274,6 +276,7 @@ fn draw_metrics(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
         .expect("no app txn duration records")
         .filter_by_label(0, "ok");
     plot_chart(
+        &cfg,
         &children_area,
         &font,
         colors,
@@ -290,6 +293,7 @@ fn draw_metrics(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
         .unwrap()
         .filter_by_label(0, "fail");
     plot_chart(
+        &cfg,
         &children_area,
         &font,
         colors,
@@ -306,6 +310,7 @@ fn draw_metrics(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
         .unwrap()
         .filter_by_label(0, "ok");
     plot_chart(
+        &cfg,
         &children_area,
         &font,
         colors,
@@ -322,6 +327,7 @@ fn draw_metrics(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
         .unwrap()
         .filter_by_label(0, "fail");
     plot_chart(
+        &cfg,
         &children_area,
         &font,
         colors,
@@ -334,6 +340,7 @@ fn draw_metrics(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     plot_chart(
+        &cfg,
         &children_area,
         &font,
         colors,
@@ -346,6 +353,7 @@ fn draw_metrics(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     plot_chart(
+        &cfg,
         &children_area,
         &font,
         colors,
@@ -445,6 +453,7 @@ fn draw_metrics(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
         .group_by_label(1, AggregateMethod::Max);
 
     plot_chart(
+        &cfg,
         &children_area,
         &font,
         colors,
@@ -456,6 +465,7 @@ fn draw_metrics(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
         "",
     )?;
     plot_chart(
+        &cfg,
         &children_area,
         &font,
         colors,
@@ -467,6 +477,7 @@ fn draw_metrics(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
         "",
     )?;
     plot_chart(
+        &cfg,
         &children_area,
         &font,
         colors,
@@ -478,6 +489,7 @@ fn draw_metrics(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
         ms_label,
     )?;
     plot_chart(
+        &cfg,
         &children_area,
         &font,
         colors,
@@ -489,6 +501,7 @@ fn draw_metrics(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
         "",
     )?;
     plot_chart(
+        &cfg,
         &children_area,
         &font,
         colors,
@@ -500,6 +513,7 @@ fn draw_metrics(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
         "%",
     )?;
     plot_chart(
+        &cfg,
         &children_area,
         &font,
         colors,
@@ -511,6 +525,7 @@ fn draw_metrics(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
         "%",
     )?;
     plot_chart(
+        &cfg,
         &children_area,
         &font,
         colors,
@@ -522,6 +537,7 @@ fn draw_metrics(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
         "",
     )?;
     plot_chart(
+        &cfg,
         &children_area,
         &font,
         colors,
@@ -533,6 +549,7 @@ fn draw_metrics(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
         "",
     )?;
     plot_chart(
+        &cfg,
         &children_area,
         &font,
         colors,
@@ -544,6 +561,7 @@ fn draw_metrics(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
         "",
     )?;
     plot_chart(
+        &cfg,
         &children_area,
         &font,
         colors,
@@ -555,6 +573,7 @@ fn draw_metrics(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
         ms_label,
     )?;
     plot_chart(
+        &cfg,
         &children_area,
         &font,
         colors,
@@ -566,6 +585,7 @@ fn draw_metrics(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
         ms_label,
     )?;
     plot_chart(
+        &cfg,
         &children_area,
         &font,
         colors,
@@ -582,6 +602,7 @@ fn draw_metrics(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn plot_chart(
+    cfg: &Config,
     children_area: &[DrawingArea<SVGBackend, Shift>],
     font: &FontDesc,
     colors: [RGBColor; 30],
@@ -592,7 +613,9 @@ fn plot_chart(
     y_unit: Time,
     y_label: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let x_spec = 0f32..metrics.max_time() as f32;
+    assert_eq!(metrics::TIME_BUCKET_RANGE, SECOND);
+    let max_time = cfg.max_time / SECOND;
+    let x_spec = 0f32..max_time as f32;
     let y_spec = metrics.min_value() as f32..(if matches!(opts, Opts::Hist(HistOpts::Count)) {
         metrics.max_count() as i64
     } else {
@@ -611,9 +634,10 @@ fn plot_chart(
         .configure_mesh()
         .disable_mesh()
         .y_label_formatter(&|x| format!("{}{}", x, y_label))
+        .x_label_formatter(&|x| format!("{}s", x))
         .draw()?;
 
-    let mut data = metrics.data_point_series(opts);
+    let mut data = metrics.data_point_series(max_time as usize, opts);
     data.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
     for (i, (name, series)) in data.iter().enumerate() {
@@ -1491,8 +1515,10 @@ impl PeerSelector {
                     *state = StaleReaderState::LeaderNormal;
                     let s = servers
                         .iter_mut()
-                        .filter(|s| s.zone == self.local_zone)
-                        .find(|s| s.peers.contains_key(&req.region_id))
+                        .filter(|s| {
+                            s.zone == self.local_zone && s.peers.contains_key(&req.region_id)
+                        })
+                        .choose(&mut rand::thread_rng())
                         .unwrap();
                     Some(s)
                 }
@@ -1537,8 +1563,10 @@ impl PeerSelector {
                     assert_eq!(req.req_type, EventType::ReadRequest);
                     let s = servers
                         .iter_mut()
-                        .filter(|s| s.zone == self.local_zone)
-                        .find(|s| s.peers.contains_key(&req.region_id))
+                        .filter(|s| {
+                            s.zone == self.local_zone && s.peers.contains_key(&req.region_id)
+                        })
+                        .choose(&mut rand::thread_rng())
                         .unwrap();
                     self.server_ids_tried_for_normal_read.insert(s.server_id);
                     self.state = PeerSelectorState::NormalRead(NormalReaderState::LeaderNormal);

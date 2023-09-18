@@ -9,7 +9,7 @@ pub type Name = String;
 
 // Define the TimeBucket type
 pub type TimeBucket = Time; // Represents the start of each second
-const TIME_BUCKET_RANGE: Time = SECOND;
+pub const TIME_BUCKET_RANGE: Time = SECOND;
 
 pub type HistogramSeries = HashMap<TimeBucket, Histogram<Time>>;
 pub type CounterSeries = HashMap<TimeBucket, i64>;
@@ -188,7 +188,7 @@ pub trait MetricsDataTrait {
     fn max_time(&self) -> usize;
     fn max_value(&self) -> i64;
     fn min_value(&self) -> i64;
-    fn data_point_series(&self, opts: Opts) -> Vec<(String, Vec<(f64, f64)>)>;
+    fn data_point_series(&self, max_time: usize, opts: Opts) -> Vec<(String, Vec<(f64, f64)>)>;
 }
 
 impl MetricsDataTrait for HistogramSeries {
@@ -207,13 +207,13 @@ impl MetricsDataTrait for HistogramSeries {
         0
     }
 
-    fn data_point_series(&self, opts: Opts) -> Vec<(String, Vec<(f64, f64)>)> {
+    fn data_point_series(&self, max_time: usize, opts: Opts) -> Vec<(String, Vec<(f64, f64)>)> {
         let mut res = vec![];
         match opts {
             Opts::Hist(HistOpts::Count) => {
                 res.push((
                     "-count".to_owned(),
-                    (0..self.max_time())
+                    (0..max_time)
                         .map(|t| {
                             (
                                 t as f64,
@@ -229,7 +229,7 @@ impl MetricsDataTrait for HistogramSeries {
                 if mean {
                     res.push((
                         "-mean".to_owned(),
-                        (0..self.max_time())
+                        (0..max_time)
                             .map(|t| {
                                 (
                                     t as f64,
@@ -244,7 +244,7 @@ impl MetricsDataTrait for HistogramSeries {
                 if p99 {
                     res.push((
                         "-p99".to_owned(),
-                        (0..self.max_time())
+                        (0..max_time)
                             .map(|t| {
                                 (
                                     t as f64,
@@ -259,7 +259,7 @@ impl MetricsDataTrait for HistogramSeries {
                 if p9999 {
                     res.push((
                         "-p9999".to_owned(),
-                        (0..self.max_time())
+                        (0..max_time)
                             .map(|t| {
                                 (
                                     t as f64,
@@ -291,10 +291,10 @@ impl MetricsDataTrait for CounterSeries {
         self.values().min().copied().unwrap_or(0).min(0)
     }
 
-    fn data_point_series(&self, _: Opts) -> Vec<(String, Vec<(f64, f64)>)> {
+    fn data_point_series(&self, max_time: usize, _: Opts) -> Vec<(String, Vec<(f64, f64)>)> {
         vec![(
             String::new(),
-            (0..self.max_time())
+            (0..max_time)
                 .map(|t| {
                     (
                         t as f64,
@@ -369,13 +369,13 @@ impl MetricsDataTrait for MetricGroup {
         }
     }
 
-    fn data_point_series(&self, opts: Opts) -> Vec<(String, Vec<(f64, f64)>)> {
+    fn data_point_series(&self, max_time: usize, opts: Opts) -> Vec<(String, Vec<(f64, f64)>)> {
         match self {
             MetricGroup::Histogram(h) => h
                 .iter()
                 .flat_map(|(label, series)| {
                     series
-                        .data_point_series(opts)
+                        .data_point_series(max_time, opts)
                         .into_iter()
                         .map(|(name, points)| (format!("{}{}", label.join("-"), name), points))
                 })
@@ -384,7 +384,7 @@ impl MetricsDataTrait for MetricGroup {
                 .iter()
                 .flat_map(|(label, series)| {
                     series
-                        .data_point_series(opts)
+                        .data_point_series(max_time, opts)
                         .into_iter()
                         .map(|(name, points)| (format!("{}{}", label.join("-"), name), points))
                 })
@@ -393,7 +393,7 @@ impl MetricsDataTrait for MetricGroup {
                 .iter()
                 .flat_map(|(label, series)| {
                     series
-                        .data_point_series(opts)
+                        .data_point_series(max_time, opts)
                         .into_iter()
                         .map(|(name, points)| (format!("{}{}", label.join("-"), name), points))
                 })
