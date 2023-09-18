@@ -117,7 +117,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config {
         num_replica: 3,
         num_region: 10000,
-        num_servers: 3,
+        num_servers: 6,
         max_time: 500 * SECOND,
         metrics_interval: SECOND,
         enable_trace: false,
@@ -134,7 +134,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         app_config: AppConfig {
             retry: false,
-            txn_rate: 300.0,
+            txn_rate: 600.0,
             read_staleness: Some(12 * SECOND),
             read_size_fn: Rc::new(|| (rand::random::<u64>() % 5 + 1) * MILLISECOND),
             prewrite_size_fn: Rc::new(|| (rand::random::<u64>() % 30 + 1) * MILLISECOND),
@@ -165,7 +165,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         app: App::new(events.clone(), &config),
     };
     model.init(&config);
-    model.inject_read_delay();
+    // model.inject_read_delay();
+    model.inject_high_pressure();
 
     let bar = ProgressBar::new(config.max_time / SECOND);
     loop {
@@ -258,7 +259,8 @@ fn draw_metrics(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
 
     let app_txn_latency = M
         .get_metric_group("app_txn_duration")
-        .expect("no app txn duration records");
+        .expect("no app txn duration records")
+        .filter_by_label(0, "ok");
     plot_chart(
         &children_area,
         &font,
@@ -371,9 +373,6 @@ fn draw_metrics(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
         server_writer_utilization = M
             .get_metric_group("server_write_worker_busy_time")
             .unwrap_or_default();
-        server_read_req_count = M
-            .get_metric_group("server_read_request_count")
-            .unwrap_or_default();
         server_write_req_count = M
             .get_metric_group("server_write_request_count")
             .unwrap_or_default();
@@ -412,10 +411,6 @@ fn draw_metrics(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
             .get_metric_group("server_write_worker_busy_time")
             .unwrap_or_default()
             .group_by_label(0, AggregateMethod::Max);
-        server_read_req_count = M
-            .get_metric_group("server_read_request_count")
-            .unwrap_or_default()
-            .group_by_label(0, AggregateMethod::Max);
         server_write_req_count = M
             .get_metric_group("server_write_request_count")
             .unwrap_or_default()
@@ -437,6 +432,11 @@ fn draw_metrics(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_default()
             .group_by_label(0, AggregateMethod::Max);
     };
+    // FIXME: aggregate on zone and state
+    server_read_req_count = M
+        .get_metric_group("server_read_request_count")
+        .unwrap_or_default()
+        .group_by_label(0, AggregateMethod::Min);
     plot_chart(
         &children_area,
         &font,
@@ -721,7 +721,7 @@ impl Model {
             }),
         ));
         self.events.borrow_mut().push(Event::new(
-            110 * SECOND,
+            150 * SECOND,
             EventType::Injection,
             Box::new(move |model| {
                 model.servers[0].read_delay = 0;
@@ -774,30 +774,25 @@ impl Model {
             leader.broadcast_safe_ts(self.events.clone());
             self.servers[leader_idx].peers.insert(region_id, leader);
 
-            for _ in 0..self.num_replica - 1 {
-                let leader_zone = self.servers[leader_idx].zone.into_id();
-                let follower_zones =
-                    (0..self.num_replica as u64).filter(|zone| zone != &leader_zone);
-                for zone in follower_zones {
-                    let server_with_min_followers = Self::fewest_follower_server_in_zone(
-                        &mut self.servers,
-                        Zone::from_id(zone),
-                    );
-                    let server_id = server_with_min_followers.server_id;
-                    server_with_min_followers.peers.insert(
+            let leader_zone = self.servers[leader_idx].zone.into_id();
+            let follower_zones = (0..self.num_replica as u64).filter(|zone| zone != &leader_zone);
+            for zone in follower_zones {
+                let server_with_min_followers =
+                    Self::fewest_follower_server_in_zone(&mut self.servers, Zone::from_id(zone));
+                let server_id = server_with_min_followers.server_id;
+                server_with_min_followers.peers.insert(
+                    region_id,
+                    Peer {
+                        role: Role::Follower,
+                        server_id,
                         region_id,
-                        Peer {
-                            role: Role::Follower,
-                            server_id,
-                            region_id,
-                            resolved_ts: 0,
-                            safe_ts: 0,
-                            lock_cf: HashSet::new(),
-                            advance_interval: cfg.server_config.advance_interval,
-                            broadcast_interval: cfg.server_config.broadcast_interval,
-                        },
-                    );
-                }
+                        resolved_ts: 0,
+                        safe_ts: 0,
+                        lock_cf: HashSet::new(),
+                        advance_interval: cfg.server_config.advance_interval,
+                        broadcast_interval: cfg.server_config.broadcast_interval,
+                    },
+                );
             }
             leader_idx = (leader_idx + 1) % self.servers.len();
         }
