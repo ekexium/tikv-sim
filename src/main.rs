@@ -165,7 +165,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         app: App::new(events.clone(), &config),
     };
     model.init(&config);
-    model.inject_high_pressure();
+    model.inject_read_delay();
+    // model.inject_high_pressure();
 
     let bar = ProgressBar::new(config.max_time / SECOND);
     loop {
@@ -442,7 +443,7 @@ fn draw_metrics(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
     server_read_req_count = M
         .get_metric_group("server_read_request_count")
         .unwrap_or_default()
-        .group_by_label(0, AggregateMethod::Min);
+        .group_by_label(0, AggregateMethod::Sum);
     server_write_req_count = M
         .get_metric_group("server_write_request_count")
         .unwrap_or_default()
@@ -748,14 +749,18 @@ impl Model {
             100 * SECOND,
             EventType::Injection,
             Box::new(move |model| {
-                model.servers[0].read_delay = SECOND;
+                for id in 0..3 {
+                    model.servers[id].read_delay = SECOND;
+                }
             }),
         ));
         self.events.borrow_mut().push(Event::new(
             150 * SECOND,
             EventType::Injection,
             Box::new(move |model| {
-                model.servers[0].read_delay = 0;
+                for id in 0..3 {
+                    model.servers[id].read_delay = 0;
+                }
             }),
         ));
     }
