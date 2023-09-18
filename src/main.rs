@@ -117,7 +117,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config {
         num_replica: 3,
         num_region: 10000,
-        num_servers: 6,
+        num_servers: 12,
         max_time: 500 * SECOND,
         metrics_interval: SECOND,
         enable_trace: false,
@@ -134,7 +134,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         app_config: AppConfig {
             retry: false,
-            txn_rate: 600.0,
+            txn_rate: 1200.0,
             read_staleness: Some(12 * SECOND),
             read_size_fn: Rc::new(|| (rand::random::<u64>() % 5 + 1) * MILLISECOND),
             prewrite_size_fn: Rc::new(|| (rand::random::<u64>() % 30 + 1) * MILLISECOND),
@@ -165,7 +165,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         app: App::new(events.clone(), &config),
     };
     model.init(&config);
-    // model.inject_read_delay();
     model.inject_high_pressure();
 
     let bar = ProgressBar::new(config.max_time / SECOND);
@@ -194,7 +193,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn draw_metrics(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
     use plotters::prelude::*;
-    let num_graphs = 19;
+    let num_graphs = 20;
     let root = SVGBackend::new("0.svg", (1200, num_graphs * 300)).into_drawing_area();
     let children_area = root.split_evenly(((num_graphs as usize + 1) / 2, 2));
     let font = ("Jetbrains Mono", 15).into_font();
@@ -240,6 +239,19 @@ fn draw_metrics(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
     let gauge_opts = Opts::Gauge;
     let (ms_unit, ms_label) = (MILLISECOND, "ms");
     let mut chart_id = 0;
+
+    let app_gen_txn_counter = M.get_metric_group("app_gen_txn_counter").unwrap();
+    plot_chart(
+        &children_area,
+        &font,
+        colors,
+        counter_opts,
+        &mut chart_id,
+        "txn generated",
+        app_gen_txn_counter,
+        1,
+        "",
+    )?;
 
     let app_ok_txn_duration = M
         .get_metric_group("app_txn_duration")
@@ -364,17 +376,11 @@ fn draw_metrics(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
         server_max_resolved_ts_gap = M
             .get_metric_group("server_max_resolved_ts_gap")
             .unwrap_or_default();
-        advance_resolved_ts_fail_count = M
-            .get_metric_group("advance_resolved_ts_failure")
-            .unwrap_or_default();
         server_reader_utilization = M
             .get_metric_group("server_read_worker_busy_time")
             .unwrap_or_default();
         server_writer_utilization = M
             .get_metric_group("server_write_worker_busy_time")
-            .unwrap_or_default();
-        server_write_req_count = M
-            .get_metric_group("server_write_request_count")
             .unwrap_or_default();
         server_error_count = M.get_metric_group("server_error_count").unwrap_or_default();
         server_read_schedule_wait = M
@@ -399,20 +405,12 @@ fn draw_metrics(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
             .get_metric_group("server_max_resolved_ts_gap")
             .unwrap_or_default()
             .group_by_label(0, AggregateMethod::Max);
-        advance_resolved_ts_fail_count = M
-            .get_metric_group("advance_resolved_ts_failure")
-            .unwrap_or_default()
-            .group_by_label(1, AggregateMethod::Max);
         server_reader_utilization = M
             .get_metric_group("server_read_worker_busy_time")
             .unwrap_or_default()
             .group_by_label(0, AggregateMethod::Max);
         server_writer_utilization = M
             .get_metric_group("server_write_worker_busy_time")
-            .unwrap_or_default()
-            .group_by_label(0, AggregateMethod::Max);
-        server_write_req_count = M
-            .get_metric_group("server_write_request_count")
             .unwrap_or_default()
             .group_by_label(0, AggregateMethod::Max);
         server_error_count = M
@@ -437,6 +435,15 @@ fn draw_metrics(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
         .get_metric_group("server_read_request_count")
         .unwrap_or_default()
         .group_by_label(0, AggregateMethod::Min);
+    server_write_req_count = M
+        .get_metric_group("server_write_request_count")
+        .unwrap_or_default()
+        .group_by_label(0, AggregateMethod::Min);
+    advance_resolved_ts_fail_count = M
+        .get_metric_group("advance_resolved_ts_failure")
+        .unwrap_or_default()
+        .group_by_label(1, AggregateMethod::Max);
+
     plot_chart(
         &children_area,
         &font,
@@ -734,14 +741,16 @@ impl Model {
             100 * SECOND,
             EventType::Injection,
             Box::new(move |model| {
-                model.app.txn_interval_adjust_value = -(MILLISECOND as i64);
+                model.app.rate_exp_dist = Exp::new(model.app.txn_rate * 1.25).unwrap();
+                // model.app.txn_interval_adjust_value = -(200 * MICROSECOND as i64);
             }),
         ));
         self.events.borrow_mut().push(Event::new(
             150 * SECOND,
             EventType::Injection,
             Box::new(move |model| {
-                model.app.txn_interval_adjust_value = 0;
+                model.app.rate_exp_dist = Exp::new(model.app.txn_rate).unwrap();
+                // model.app.txn_interval_adjust_value = 0;
             }),
         ));
     }
@@ -1772,6 +1781,7 @@ struct App {
     txn_interval_adjust_value: i64,
 
     // configs
+    txn_rate: f64,
     read_size_fn: Rc<dyn Fn() -> Time>,
     prewrite_size_fn: Rc<dyn Fn() -> Time>,
     commit_size_fn: Rc<dyn Fn() -> Time>,
@@ -1943,6 +1953,7 @@ impl App {
             pending_transactions: HashMap::new(),
             txn_duration_stat: new_hist(),
             read_staleness: cfg.app_config.read_staleness,
+            txn_rate: cfg.app_config.txn_rate,
             num_region: cfg.num_region,
             read_size_fn: cfg.app_config.read_size_fn.clone(),
             prewrite_size_fn: cfg.app_config.prewrite_size_fn.clone(),
@@ -1957,6 +1968,7 @@ impl App {
 
     fn gen_txn(&mut self) {
         // x% read-only, (1-x)% read-only transactions. independent of stale read
+        M.inc_counter("app_gen_txn_counter", vec![], 1);
         let read_only = rand::random::<f64>() < self.read_only_ratio;
         let mut txn = Transaction::new(
             (self.num_queries_fn)(),
