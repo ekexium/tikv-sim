@@ -225,7 +225,12 @@ impl MetricsDataTrait for HistogramSeries {
                         .collect(),
                 ));
             }
-            Opts::Hist(HistOpts::Percentiles { mean, p99, p9999 }) => {
+            Opts::Hist(HistOpts::Percentiles {
+                mean,
+                p99,
+                p999,
+                p9999,
+            }) => {
                 if mean {
                     res.push((
                         "-mean".to_owned(),
@@ -250,6 +255,21 @@ impl MetricsDataTrait for HistogramSeries {
                                     t as f64,
                                     self.get(&(t as TimeBucket))
                                         .map(|hist| hist.value_at_quantile(0.99) as f64)
+                                        .unwrap_or(0.0),
+                                )
+                            })
+                            .collect(),
+                    ));
+                }
+                if p999 {
+                    res.push((
+                        "-p999".to_owned(),
+                        (0..max_time)
+                            .map(|t| {
+                                (
+                                    t as f64,
+                                    self.get(&(t as TimeBucket))
+                                        .map(|hist| hist.value_at_quantile(0.999) as f64)
                                         .unwrap_or(0.0),
                                 )
                             })
@@ -405,7 +425,12 @@ impl MetricsDataTrait for MetricGroup {
 #[derive(Copy, Clone)]
 pub enum HistOpts {
     Count,
-    Percentiles { mean: bool, p99: bool, p9999: bool },
+    Percentiles {
+        mean: bool,
+        p99: bool,
+        p999: bool,
+        p9999: bool,
+    },
 }
 
 #[derive(Copy, Clone)]

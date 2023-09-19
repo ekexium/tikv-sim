@@ -165,8 +165,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         app: App::new(events.clone(), &config),
     };
     model.init(&config);
-    model.inject_read_delay();
-    // model.inject_high_pressure();
+    // model.inject_read_delay();
+    model.inject_high_pressure();
 
     let bar = ProgressBar::new(config.max_time / SECOND);
     loop {
@@ -232,7 +232,8 @@ fn draw_metrics(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
     ];
     let hist_latency_opts = Opts::Hist(HistOpts::Percentiles {
         mean: true,
-        p99: true,
+        p99: false,
+        p999: false,
         p9999: false,
     });
     let hist_count_opts = Opts::Hist(HistOpts::Count);
