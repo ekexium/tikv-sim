@@ -140,7 +140,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             prewrite_size_fn: Rc::new(|| (rand::random::<u64>() % 30 + 1) * MILLISECOND),
             commit_size_fn: Rc::new(|| (rand::random::<u64>() % 20 + 1) * MILLISECOND),
             num_queries_fn: Rc::new(|| 5),
-            read_only_ratio: 0.99,
+            read_only_ratio: 1.0,
         },
     };
     assert_eq!(config.metrics_interval, SECOND, "why bother");
@@ -444,7 +444,7 @@ fn draw_metrics(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
     server_read_req_count = M
         .get_metric_group("server_read_request_count")
         .unwrap_or_default()
-        .group_by_label(0, AggregateMethod::Sum);
+        .group_by_label(2, AggregateMethod::Sum);
     server_write_req_count = M
         .get_metric_group("server_write_request_count")
         .unwrap_or_default()
@@ -1007,13 +1007,13 @@ impl Display for Zone {
     }
 }
 
-#[derive(PartialEq, Eq, Hash)]
+#[derive(PartialEq, Eq, Hash, Debug)]
 enum Role {
     Leader,
     Follower,
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Eq, Debug)]
 struct Peer {
     role: Role,
     server_id: u64,
@@ -1152,6 +1152,7 @@ impl Server {
     }
 
     fn on_req(&mut self, mut task: Request) {
+        assert!(task.selector_state.is_valid());
         task.trace.record(format!(
             "{}: server-{}, recv req {}",
             now().pretty_print(),
@@ -1216,7 +1217,7 @@ impl Server {
 
         let task_size = req.size + self.read_delay;
         let stale_read_ts = req.stale_read_ts;
-        let is_retry = req.selector_state.is_retry();
+        let is_retry = req.selector_state.ignore_read_timeout();
         self.read_workers[worker_id] = Some((now(), req));
         let this_server_id = self.server_id;
 
@@ -1391,7 +1392,27 @@ impl Server {
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Ord, PartialOrd)]
-enum PeerSelectorState {
+struct PeerSelectorState {
+    state_type: PeerSelectorStateType,
+    round: u8,
+}
+
+impl PeerSelectorState {
+    fn is_valid(&self) -> bool {
+        match self.state_type {
+            PeerSelectorStateType::Unknown => false,
+            PeerSelectorStateType::StaleRead(s) if matches!(s, StaleReaderState::Initial) => false,
+            PeerSelectorStateType::NormalRead(s) if matches!(s, NormalReaderState::Initial) => {
+                false
+            }
+            PeerSelectorStateType::Write(s) if matches!(s, WriterState::Initial) => false,
+            _ => true,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Ord, PartialOrd)]
+enum PeerSelectorStateType {
     // the default value of requests, should never use it
     Unknown,
     StaleRead(StaleReaderState),
@@ -1400,34 +1421,28 @@ enum PeerSelectorState {
 }
 
 impl PeerSelectorState {
-    fn is_retry(&self) -> bool {
-        match self {
-            PeerSelectorState::Unknown => unreachable!(),
-            PeerSelectorState::StaleRead(s) => match s {
-                StaleReaderState::LocalStale => false,
-                StaleReaderState::LeaderNormal => true,
-                StaleReaderState::RandomFollowerNormal => true,
-            },
-            PeerSelectorState::NormalRead(s) => match s {
-                NormalReaderState::Local => false,
-                NormalReaderState::LeaderNormal => true,
-                NormalReaderState::RandomFollowerNormal => true,
-            },
-            PeerSelectorState::Write(s) => match s {
-                WriterState::Leader => false,
-                WriterState::LeaderFailed => unreachable!(),
-            },
+    fn ignore_read_timeout(&self) -> bool {
+        match self.state_type {
+            PeerSelectorStateType::Unknown => unreachable!(),
+            PeerSelectorStateType::StaleRead(_) | PeerSelectorStateType::NormalRead(_) => {
+                self.round > 0
+            }
+            PeerSelectorStateType::Write(_) => true,
         }
     }
 }
 
 impl Display for PeerSelectorState {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PeerSelectorState::Unknown => write!(f, "Unknown"),
-            PeerSelectorState::StaleRead(state) => write!(f, "StaleRead-{}", state),
-            PeerSelectorState::NormalRead(state) => write!(f, "NormalRead-{}", state),
-            PeerSelectorState::Write(state) => write!(f, "Write-{}", state),
+        match self.state_type {
+            PeerSelectorStateType::Unknown => write!(f, "round{}-Unknown", self.round),
+            PeerSelectorStateType::StaleRead(state) => {
+                write!(f, "round{}-StaleRead-{}", self.round, state)
+            }
+            PeerSelectorStateType::NormalRead(state) => {
+                write!(f, "round{}-NormalRead-{}", self.round, state)
+            }
+            PeerSelectorStateType::Write(state) => write!(f, "round{}-Write-{}", self.round, state),
         }
     }
 }
@@ -1435,9 +1450,10 @@ impl Display for PeerSelectorState {
 // local(stale) -> leader(normal) -> random follower(normal) -> error
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Ord, PartialOrd)]
 enum StaleReaderState {
+    Initial,
     LocalStale,
     LeaderNormal,
-    RandomFollowerNormal,
+    FollowerNormal,
 }
 
 impl Display for StaleReaderState {
@@ -1445,16 +1461,18 @@ impl Display for StaleReaderState {
         match self {
             StaleReaderState::LocalStale => write!(f, "LocalStale"),
             StaleReaderState::LeaderNormal => write!(f, "LeaderNormal"),
-            StaleReaderState::RandomFollowerNormal => write!(f, "RandomFollowerNormal"),
+            StaleReaderState::FollowerNormal => write!(f, "RandomFollowerNormal"),
+            StaleReaderState::Initial => write!(f, "Initial"),
         }
     }
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Ord, PartialOrd)]
 enum NormalReaderState {
+    Initial,
     Local,
     LeaderNormal,
-    RandomFollowerNormal,
+    FollowerNormal,
 }
 
 impl Display for NormalReaderState {
@@ -1462,22 +1480,23 @@ impl Display for NormalReaderState {
         match self {
             NormalReaderState::Local => write!(f, "Local"),
             NormalReaderState::LeaderNormal => write!(f, "LeaderNormal"),
-            NormalReaderState::RandomFollowerNormal => write!(f, "RandomFollowerNormal"),
+            NormalReaderState::FollowerNormal => write!(f, "RandomFollowerNormal"),
+            NormalReaderState::Initial => write!(f, "Initial"),
         }
     }
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Ord, PartialOrd)]
 enum WriterState {
+    Initial,
     Leader,
-    LeaderFailed,
 }
 
 impl Display for WriterState {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             WriterState::Leader => write!(f, "Leader"),
-            WriterState::LeaderFailed => write!(f, "LeaderFailed"),
+            WriterState::Initial => write!(f, "Initial"),
         }
     }
 }
@@ -1488,37 +1507,147 @@ struct PeerSelector {
     // already tried to perform non-stale read on these servers, no matter they are leader or follower
     server_ids_tried_for_normal_read: HashSet<u64>,
     local_zone: Zone,
+    // (1st round) local-stale -> leader-non-stale -> follower-non-stale -> (2nd) round local-stale ...
+    // the stale read ts cannot be simply discarded, we buffer it here for future rounds.
+    buffered_stale_read_ts: Option<u64>,
 }
 
 impl PeerSelector {
     fn new(local: Zone, req: &Request) -> Self {
-        let state = match req.req_type {
+        let state_type = match req.req_type {
             EventType::ReadRequest => {
                 if req.stale_read_ts.is_some() {
-                    PeerSelectorState::StaleRead(StaleReaderState::LocalStale)
+                    PeerSelectorStateType::StaleRead(StaleReaderState::Initial)
                 } else {
-                    PeerSelectorState::NormalRead(NormalReaderState::Local)
+                    PeerSelectorStateType::NormalRead(NormalReaderState::Initial)
                 }
             }
             EventType::PrewriteRequest | EventType::CommitRequest => {
-                PeerSelectorState::Write(WriterState::Leader)
+                PeerSelectorStateType::Write(WriterState::Initial)
             }
             _ => unreachable!(),
         };
         Self {
-            state,
+            state: PeerSelectorState {
+                state_type,
+                round: 0,
+            },
             server_ids_tried_for_normal_read: HashSet::new(),
             local_zone: local,
+            buffered_stale_read_ts: None,
         }
     }
 
-    fn next<'a>(&mut self, servers: &'a mut [Server], req: &mut Request) -> Option<&'a mut Server> {
-        match &mut self.state {
-            PeerSelectorState::StaleRead(state) => match state {
+    // Returns true if the state is changed. We can retry on the next peer.
+    // Returns false if all peers have been tried and we cannot retry.
+    // In this case, the caller should return an error.
+    fn next(
+        &mut self,
+        servers: &mut [Server],
+        req: &mut Request,
+        last_error: Option<Error>,
+    ) -> bool {
+        match &mut self.state.state_type {
+            PeerSelectorStateType::Unknown => unreachable!(),
+            PeerSelectorStateType::StaleRead(s) => match s {
+                StaleReaderState::Initial => {
+                    *s = StaleReaderState::LocalStale;
+                    assert!(req.stale_read_ts.is_some());
+                    true
+                }
+                StaleReaderState::LocalStale => {
+                    *s = StaleReaderState::LeaderNormal;
+                    self.buffered_stale_read_ts = req.stale_read_ts;
+                    req.stale_read_ts = None;
+                    true
+                }
+                StaleReaderState::LeaderNormal => {
+                    assert_eq!(
+                        last_error,
+                        Some(Error::ReadTimeout),
+                        "read timeout is the only possible error for now"
+                    );
+                    assert_eq!(self.state.round, 0, "round > 0, should not fail");
+                    *s = StaleReaderState::FollowerNormal;
+                    true
+                }
+                StaleReaderState::FollowerNormal => {
+                    assert_eq!(
+                        last_error,
+                        Some(Error::ReadTimeout),
+                        "read timeout is the only possible error for now"
+                    );
+                    let num_followers = Model::find_followers_by_id(servers, req.region_id).len();
+                    if self.server_ids_tried_for_normal_read.len() == num_followers + 1 {
+                        assert_eq!(self.state.round, 0, "round > 0, should not fail");
+                        assert!(self.buffered_stale_read_ts.is_some());
+                        *s = StaleReaderState::LocalStale;
+                        self.state.round += 1;
+                        req.stale_read_ts = self.buffered_stale_read_ts;
+                        self.server_ids_tried_for_normal_read.clear();
+                        true
+                    } else {
+                        // more followers to try
+                        true
+                    }
+                }
+            },
+            PeerSelectorStateType::NormalRead(s) => match s {
+                NormalReaderState::Initial => {
+                    *s = NormalReaderState::Local;
+                    true
+                }
+                NormalReaderState::Local => {
+                    *s = NormalReaderState::LeaderNormal;
+                    true
+                }
+                NormalReaderState::LeaderNormal => {
+                    assert_eq!(
+                        last_error,
+                        Some(Error::ReadTimeout),
+                        "read timeout is the only possible error for now"
+                    );
+                    assert_eq!(self.state.round, 0, "round > 0, should not fail");
+                    *s = NormalReaderState::FollowerNormal;
+                    true
+                }
+                NormalReaderState::FollowerNormal => {
+                    assert_eq!(
+                        last_error,
+                        Some(Error::ReadTimeout),
+                        "read timeout is the only possible error for now"
+                    );
+                    let num_followers = Model::find_followers_by_id(servers, req.region_id).len();
+                    if self.server_ids_tried_for_normal_read.len() == num_followers + 1 {
+                        assert_eq!(self.state.round, 0, "round > 0, should not fail");
+                        *s = NormalReaderState::Local;
+                        self.state.round += 1;
+                        self.server_ids_tried_for_normal_read.clear();
+                        true
+                    } else {
+                        // more followers to try
+                        true
+                    }
+                }
+            },
+            PeerSelectorStateType::Write(s) => match s {
+                WriterState::Initial => {
+                    *s = WriterState::Leader;
+                    true
+                }
+                WriterState::Leader => {
+                    unreachable!("server should not return errors for write requests")
+                }
+            },
+        }
+    }
+
+    fn select<'a>(&mut self, servers: &'a mut [Server], req: &Request) -> Option<&'a mut Server> {
+        match &self.state.state_type {
+            PeerSelectorStateType::StaleRead(state) => match state {
                 StaleReaderState::LocalStale => {
                     assert_eq!(req.req_type, EventType::ReadRequest);
                     assert!(req.stale_read_ts.is_some());
-                    *state = StaleReaderState::LeaderNormal;
                     let s = servers
                         .iter_mut()
                         .filter(|s| {
@@ -1530,15 +1659,14 @@ impl PeerSelector {
                 }
                 StaleReaderState::LeaderNormal => {
                     assert_eq!(req.req_type, EventType::ReadRequest);
-                    req.stale_read_ts = None;
-                    *state = StaleReaderState::RandomFollowerNormal;
                     let leader = Model::find_leader_by_id(servers, req.region_id);
                     let server_id = leader.server_id;
                     let s = Model::find_server_by_id(servers, server_id);
                     self.server_ids_tried_for_normal_read.insert(s.server_id);
                     Some(s)
                 }
-                StaleReaderState::RandomFollowerNormal => {
+                StaleReaderState::FollowerNormal => {
+                    // TODO: in practice, we prioritize the local follower. Here the model randomly choose one.
                     assert_eq!(req.req_type, EventType::ReadRequest);
                     assert!(req.stale_read_ts.is_none());
                     let mut rng = rand::thread_rng();
@@ -1553,18 +1681,20 @@ impl PeerSelector {
                     let server_id = follower.map(|f| f.server_id);
                     server_id.map(|id| Model::find_server_by_id(servers, id))
                 }
+                StaleReaderState::Initial => {
+                    unreachable!()
+                }
             },
-            PeerSelectorState::Write(state) => match state {
+            PeerSelectorStateType::Write(state) => match state {
                 WriterState::Leader => {
                     let leader = Model::find_leader_by_id(servers, req.region_id);
                     let server_id = leader.server_id;
                     let s = Model::find_server_by_id(servers, server_id);
-                    *state = WriterState::LeaderFailed;
                     Some(s)
                 }
-                WriterState::LeaderFailed => None,
+                WriterState::Initial => unreachable!(),
             },
-            PeerSelectorState::NormalRead(state) => match state {
+            PeerSelectorStateType::NormalRead(state) => match state {
                 NormalReaderState::Local => {
                     assert_eq!(req.req_type, EventType::ReadRequest);
                     let s = servers
@@ -1575,7 +1705,6 @@ impl PeerSelector {
                         .choose(&mut rand::thread_rng())
                         .unwrap();
                     self.server_ids_tried_for_normal_read.insert(s.server_id);
-                    self.state = PeerSelectorState::NormalRead(NormalReaderState::LeaderNormal);
                     Some(s)
                 }
                 NormalReaderState::LeaderNormal => {
@@ -1584,11 +1713,10 @@ impl PeerSelector {
                     let server_id = leader.server_id;
                     let s = Model::find_server_by_id(servers, server_id);
                     self.server_ids_tried_for_normal_read.insert(s.server_id);
-                    self.state =
-                        PeerSelectorState::NormalRead(NormalReaderState::RandomFollowerNormal);
                     Some(s)
                 }
-                NormalReaderState::RandomFollowerNormal => {
+                NormalReaderState::FollowerNormal => {
+                    // TODO: in practice, we prioritize the local follower. Here the model randomly choose one.
                     assert_eq!(req.req_type, EventType::ReadRequest);
                     let mut rng = rand::thread_rng();
                     let follower = Model::find_followers_by_id(servers, req.region_id)
@@ -1602,8 +1730,11 @@ impl PeerSelector {
                     let server_id = follower.map(|f| f.server_id);
                     server_id.map(|server_id| Model::find_server_by_id(servers, server_id))
                 }
+                NormalReaderState::Initial => {
+                    unreachable!()
+                }
             },
-            PeerSelectorState::Unknown => {
+            PeerSelectorStateType::Unknown => {
                 unreachable!()
             }
         }
@@ -1642,11 +1773,17 @@ impl Client {
             req.req_id,
         ));
         let selector = Rc::new(RefCell::new(PeerSelector::new(self.zone, &req)));
-        self.issue_request(req, selector);
+        self.issue_request(req, selector, None);
     }
 
     // send the req to the appropriate peer. If all peers have been tried, return error to app.
-    fn issue_request(&mut self, mut req: Request, selector: Rc<RefCell<PeerSelector>>) {
+    fn issue_request(
+        &mut self,
+        mut req: Request,
+        selector: Rc<RefCell<PeerSelector>>,
+        // the last attempt failed with this error, used to help select next target server
+        last_error: Option<Error>,
+    ) {
         req.trace.record(format!(
             "{}: client {}, issued req {}, selector_state {}",
             now().pretty_print(),
@@ -1671,8 +1808,21 @@ impl Client {
             req.req_type,
             Box::new(move |model: &mut Model| {
                 let mut selector = selector.borrow_mut();
+                if !selector.next(&mut model.servers, &mut req, last_error) {
+                    // all peers have been tried, return error
+                    let this = model.find_client_by_id(this_client_id);
+                    this.pending_tasks.remove(&req_id).unwrap();
+                    model.events.borrow_mut().push(Event::new(
+                        now() + rpc_latency(false),
+                        EventType::AppResp,
+                        Box::new(move |model: &mut Model| {
+                            model.app.on_resp(req, Some(Error::RegionUnavailable));
+                        }),
+                    ));
+                    return;
+                }
+                let server = selector.select(&mut model.servers, &req);
                 req.selector_state = selector.state;
-                let server = selector.next(&mut model.servers, &mut req);
                 if let Some(server) = server {
                     req.trace.record(format!(
                         "{}: client {}, sending req {} to server {}",
@@ -1767,7 +1917,7 @@ impl Client {
                 now() - start_time,
             );
             // retry other peers
-            self.issue_request(req, selector.clone());
+            self.issue_request(req, selector.clone(), Some(e));
         } else {
             req.trace.record(format!(
                 "{}: client {}, received success for req {}",
@@ -2256,7 +2406,10 @@ impl Request {
             client_id,
             size,
             region_id: region,
-            selector_state: PeerSelectorState::Unknown,
+            selector_state: PeerSelectorState {
+                state_type: PeerSelectorStateType::Unknown,
+                round: 0,
+            },
             trace,
         }
     }
@@ -2376,12 +2529,15 @@ impl Display for EventType {
 
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 enum Error {
+    // generated by server
     // server is busy - deadline exceeded
     ReadTimeout,
     // all servers are unavailable
-    RegionUnavailable,
     DataIsNotReady,
+
+    // generated by client
     MaxExecutionTimeExceeded,
+    RegionUnavailable,
 }
 
 impl Display for Error {
