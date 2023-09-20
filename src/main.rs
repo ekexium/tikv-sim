@@ -21,6 +21,7 @@ use rand::prelude::IteratorRandom;
 use rand::rngs::{OsRng, StdRng};
 use rand::{Rng, SeedableRng};
 use rand_distr::{Distribution, Exp, LogNormal};
+use tikv_sim::circuit_breaker::CircuitBreaker;
 use tikv_sim::TimeTrait;
 use tikv_sim::{Time, *};
 
@@ -110,6 +111,16 @@ struct AppConfig {
     commit_size_fn: Rc<dyn Fn() -> Time>,
     num_queries_fn: Rc<dyn Fn() -> u64>,
     read_only_ratio: f64,
+    circuit_breaker_config: CircuitBreakerConfig,
+}
+
+#[derive(Clone)]
+struct CircuitBreakerConfig {
+    enabled: bool,
+    failure_threshold: u64,
+    success_threshold: u64,
+    half_open_tokens: u64,
+    timeout: Time,
 }
 
 fn reset() {
@@ -121,7 +132,7 @@ fn reset() {
     CURRENT_TIME.store(0, atomic::Ordering::SeqCst);
 }
 
-fn run(config: &Config, chart_name: &str, server_ids_to_inject: &[usize]) {
+fn run(config: &Config, chart_name: &str, _server_ids_to_inject: &[usize]) {
     assert_eq!(config.metrics_interval, SECOND, "why bother");
     assert!(config.num_servers >= 3); // at least 1 server per AZ.
     assert_eq!(
@@ -131,8 +142,9 @@ fn run(config: &Config, chart_name: &str, server_ids_to_inject: &[usize]) {
 
     reset();
     let events: Rc<RefCell<EventHeap>> = Rc::new(RefCell::new(EventHeap::new()));
-    let mut model = Model::new(events.clone(), &config);
-    model.inject_read_delay(server_ids_to_inject);
+    let mut model = Model::new(events.clone(), config);
+    // model.inject_read_delay(_server_ids_to_inject);
+    model.inject_high_pressure();
 
     let bar = ProgressBar::new(config.max_time / SECOND);
     loop {
@@ -154,7 +166,7 @@ fn run(config: &Config, chart_name: &str, server_ids_to_inject: &[usize]) {
         (event.f)(&mut model);
     }
     bar.finish();
-    draw_metrics(chart_name, &config).unwrap();
+    draw_metrics(chart_name, config).unwrap();
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -162,7 +174,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         num_replica: 3,
         num_region: 10000,
         num_servers: 12,
-        max_time: 300 * SECOND,
+        max_time: 800 * SECOND,
         metrics_interval: SECOND,
         enable_trace: false,
         server_config: ServerConfig {
@@ -177,7 +189,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_execution_time: 400 * MILLISECOND,
         },
         app_config: AppConfig {
-            retry_with_leader_read: true,
+            retry_with_leader_read: false,
             txn_rate: 1300.0,
             read_staleness: Some(12 * SECOND),
             read_size_fn: Rc::new(|| (rand::random::<u64>() % 5 + 1) * MILLISECOND),
@@ -185,10 +197,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             commit_size_fn: Rc::new(|| (rand::random::<u64>() % 20 + 1) * MILLISECOND),
             num_queries_fn: Rc::new(|| 5),
             read_only_ratio: 1.0,
+            circuit_breaker_config: CircuitBreakerConfig {
+                enabled: true,
+                failure_threshold: 5,
+                success_threshold: 5,
+                half_open_tokens: 5,
+                timeout: 5 * SECOND,
+            },
         },
     };
 
-    for txn_rate in [500.0] {
+    for txn_rate in [1200.0] {
         for server_ids_to_inject in [vec![0, 1, 2]] {
             for max_execution_time in [
                 250 * MILLISECOND,
@@ -196,22 +215,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 450 * MILLISECOND,
                 SECOND,
             ] {
-                for retry in [false, true] {
+                for enabled in [true, false] {
+                    config.app_config.circuit_breaker_config.enabled = enabled;
                     config.app_config.txn_rate = txn_rate;
-                    config.app_config.retry_with_leader_read = retry;
                     config.client_config.max_execution_time = max_execution_time;
                     println!(
-                        "running with txn_rate={}, server_ids_to_inject={:?}, max_execution_time={},retry={}",
-                        txn_rate, server_ids_to_inject, max_execution_time.pretty_print(), retry,
+                        "running with txn_rate={}, server_ids_to_inject={:?}, max_execution_time={}, cb_enabled={}",
+                        txn_rate,
+                        server_ids_to_inject,
+                        max_execution_time.pretty_print(),
+                        enabled,
                     );
                     run(
                         &config,
                         &format!(
-                            "{}-{:?}-{}ms-retry={}.svg",
+                            "{}-{:?}-{}ms-{}.svg",
                             txn_rate,
                             server_ids_to_inject,
                             max_execution_time / MILLISECOND,
-                            retry
+                            enabled,
                         ),
                         server_ids_to_inject.as_slice(),
                     );
@@ -225,7 +247,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn draw_metrics(chart_name: &str, cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
     use plotters::prelude::*;
-    let num_graphs = 20;
+    let num_graphs = 21;
     let root = SVGBackend::new(chart_name, (1400, num_graphs * 300)).into_drawing_area();
     let children_area = root.split_evenly(((num_graphs as usize + 1) / 2, 2));
     let font = ("Jetbrains Mono", 15).into_font();
@@ -275,7 +297,7 @@ fn draw_metrics(chart_name: &str, cfg: &Config) -> Result<(), Box<dyn std::error
 
     let app_gen_txn_counter = M.get_metric_group("app_gen_txn_counter").unwrap();
     plot_chart(
-        &cfg,
+        cfg,
         &children_area,
         &font,
         colors,
@@ -287,12 +309,26 @@ fn draw_metrics(chart_name: &str, cfg: &Config) -> Result<(), Box<dyn std::error
         "",
     )?;
 
+    let circuit_breaker_status = M.get_metric_group("circuit_breaker_status").unwrap();
+    plot_chart(
+        cfg,
+        &children_area,
+        &font,
+        colors,
+        gauge_opts,
+        &mut chart_id,
+        "circuit breaker status",
+        circuit_breaker_status,
+        1,
+        "",
+    )?;
+
     let app_ok_txn_duration = M
         .get_metric_group("app_txn_duration")
         .unwrap()
         .group_by_label(0, AggregateMethod::Sum);
     plot_chart(
-        &cfg,
+        cfg,
         &children_area,
         &font,
         colors,
@@ -309,7 +345,7 @@ fn draw_metrics(chart_name: &str, cfg: &Config) -> Result<(), Box<dyn std::error
         .expect("no app txn duration records")
         .filter_by_label(0, "ok");
     plot_chart(
-        &cfg,
+        cfg,
         &children_area,
         &font,
         colors,
@@ -326,7 +362,7 @@ fn draw_metrics(chart_name: &str, cfg: &Config) -> Result<(), Box<dyn std::error
         .unwrap()
         .filter_by_label(0, "fail");
     plot_chart(
-        &cfg,
+        cfg,
         &children_area,
         &font,
         colors,
@@ -343,7 +379,7 @@ fn draw_metrics(chart_name: &str, cfg: &Config) -> Result<(), Box<dyn std::error
         .unwrap()
         .filter_by_label(0, "ok");
     plot_chart(
-        &cfg,
+        cfg,
         &children_area,
         &font,
         colors,
@@ -360,7 +396,7 @@ fn draw_metrics(chart_name: &str, cfg: &Config) -> Result<(), Box<dyn std::error
         .unwrap()
         .filter_by_label(0, "fail");
     plot_chart(
-        &cfg,
+        cfg,
         &children_area,
         &font,
         colors,
@@ -373,7 +409,7 @@ fn draw_metrics(chart_name: &str, cfg: &Config) -> Result<(), Box<dyn std::error
     )?;
 
     plot_chart(
-        &cfg,
+        cfg,
         &children_area,
         &font,
         colors,
@@ -386,7 +422,7 @@ fn draw_metrics(chart_name: &str, cfg: &Config) -> Result<(), Box<dyn std::error
     )?;
 
     plot_chart(
-        &cfg,
+        cfg,
         &children_area,
         &font,
         colors,
@@ -486,7 +522,7 @@ fn draw_metrics(chart_name: &str, cfg: &Config) -> Result<(), Box<dyn std::error
         .group_by_label(1, AggregateMethod::Max);
 
     plot_chart(
-        &cfg,
+        cfg,
         &children_area,
         &font,
         colors,
@@ -498,7 +534,7 @@ fn draw_metrics(chart_name: &str, cfg: &Config) -> Result<(), Box<dyn std::error
         "",
     )?;
     plot_chart(
-        &cfg,
+        cfg,
         &children_area,
         &font,
         colors,
@@ -510,7 +546,7 @@ fn draw_metrics(chart_name: &str, cfg: &Config) -> Result<(), Box<dyn std::error
         "",
     )?;
     plot_chart(
-        &cfg,
+        cfg,
         &children_area,
         &font,
         colors,
@@ -522,7 +558,7 @@ fn draw_metrics(chart_name: &str, cfg: &Config) -> Result<(), Box<dyn std::error
         ms_label,
     )?;
     plot_chart(
-        &cfg,
+        cfg,
         &children_area,
         &font,
         colors,
@@ -534,7 +570,7 @@ fn draw_metrics(chart_name: &str, cfg: &Config) -> Result<(), Box<dyn std::error
         "",
     )?;
     plot_chart(
-        &cfg,
+        cfg,
         &children_area,
         &font,
         colors,
@@ -546,7 +582,7 @@ fn draw_metrics(chart_name: &str, cfg: &Config) -> Result<(), Box<dyn std::error
         "%",
     )?;
     plot_chart(
-        &cfg,
+        cfg,
         &children_area,
         &font,
         colors,
@@ -558,7 +594,7 @@ fn draw_metrics(chart_name: &str, cfg: &Config) -> Result<(), Box<dyn std::error
         "%",
     )?;
     plot_chart(
-        &cfg,
+        cfg,
         &children_area,
         &font,
         colors,
@@ -570,7 +606,7 @@ fn draw_metrics(chart_name: &str, cfg: &Config) -> Result<(), Box<dyn std::error
         "",
     )?;
     plot_chart(
-        &cfg,
+        cfg,
         &children_area,
         &font,
         colors,
@@ -582,7 +618,7 @@ fn draw_metrics(chart_name: &str, cfg: &Config) -> Result<(), Box<dyn std::error
         "",
     )?;
     plot_chart(
-        &cfg,
+        cfg,
         &children_area,
         &font,
         colors,
@@ -594,7 +630,7 @@ fn draw_metrics(chart_name: &str, cfg: &Config) -> Result<(), Box<dyn std::error
         "",
     )?;
     plot_chart(
-        &cfg,
+        cfg,
         &children_area,
         &font,
         colors,
@@ -606,7 +642,7 @@ fn draw_metrics(chart_name: &str, cfg: &Config) -> Result<(), Box<dyn std::error
         ms_label,
     )?;
     plot_chart(
-        &cfg,
+        cfg,
         &children_area,
         &font,
         colors,
@@ -618,7 +654,7 @@ fn draw_metrics(chart_name: &str, cfg: &Config) -> Result<(), Box<dyn std::error
         ms_label,
     )?;
     plot_chart(
-        &cfg,
+        cfg,
         &children_area,
         &font,
         colors,
@@ -715,16 +751,16 @@ impl Model {
             num_replica: config.num_replica,
             metrics_interval: config.metrics_interval,
             servers: (0..config.num_servers)
-                .map(|id| Server::new(Zone::from_id(id), events.clone(), &config))
+                .map(|id| Server::new(Zone::from_id(id), events.clone(), config))
                 .collect(),
             clients: vec![
-                Client::new(Zone::AZ1, events.clone(), &config),
-                Client::new(Zone::AZ2, events.clone(), &config),
-                Client::new(Zone::AZ3, events.clone(), &config),
+                Client::new(Zone::AZ1, events.clone(), config),
+                Client::new(Zone::AZ2, events.clone(), config),
+                Client::new(Zone::AZ3, events.clone(), config),
             ],
-            app: App::new(events.clone(), &config),
+            app: App::new(events.clone(), config),
         };
-        model.init(&config);
+        model.init(config);
         model
     }
 
@@ -798,7 +834,7 @@ impl Model {
 
     #[allow(unused)]
     fn inject_read_delay(&mut self, server_ids: &[usize]) {
-        let server_ids_copied: Vec<_> = server_ids.iter().copied().collect();
+        let server_ids_copied: Vec<_> = server_ids.to_vec();
         self.events.borrow_mut().push(Event::new(
             100 * SECOND,
             EventType::Injection,
@@ -808,7 +844,7 @@ impl Model {
                 }
             }),
         ));
-        let server_ids_copied: Vec<_> = server_ids.iter().copied().collect();
+        let server_ids_copied: Vec<_> = server_ids.to_vec();
         self.events.borrow_mut().push(Event::new(
             150 * SECOND,
             EventType::Injection,
@@ -962,6 +998,11 @@ impl Model {
     }
 
     fn collect_metrics(&mut self) {
+        M.set_gauge(
+            "circuit_breaker_status",
+            vec![self.app.circuit_breaker.status_string()],
+            1,
+        );
         for server in &mut self.servers {
             M.set_gauge(
                 "server_read_queue_length",
@@ -1453,15 +1494,13 @@ struct PeerSelectorState {
 
 impl PeerSelectorState {
     fn is_valid(&self) -> bool {
-        match self.state_type {
-            PeerSelectorStateType::Unknown => false,
-            PeerSelectorStateType::StaleRead(s) if matches!(s, StaleReaderState::Initial) => false,
-            PeerSelectorStateType::NormalRead(s) if matches!(s, NormalReaderState::Initial) => {
-                false
-            }
-            PeerSelectorStateType::Write(s) if matches!(s, WriterState::Initial) => false,
-            _ => true,
-        }
+        !matches!(
+            self.state_type,
+            PeerSelectorStateType::Unknown
+                | PeerSelectorStateType::StaleRead(StaleReaderState::Initial)
+                | PeerSelectorStateType::NormalRead(NormalReaderState::Initial)
+                | PeerSelectorStateType::Write(WriterState::Initial)
+        )
     }
 }
 
@@ -1515,7 +1554,7 @@ impl Display for StaleReaderState {
         match self {
             StaleReaderState::LocalStale => write!(f, "LocalStale"),
             StaleReaderState::LeaderNormal => write!(f, "LeaderNormal"),
-            StaleReaderState::FollowerNormal => write!(f, "RandomFollowerNormal"),
+            StaleReaderState::FollowerNormal => write!(f, "FollowerNormal"),
             StaleReaderState::Initial => write!(f, "Initial"),
         }
     }
@@ -1534,7 +1573,7 @@ impl Display for NormalReaderState {
         match self {
             NormalReaderState::Local => write!(f, "Local"),
             NormalReaderState::LeaderNormal => write!(f, "LeaderNormal"),
-            NormalReaderState::FollowerNormal => write!(f, "RandomFollowerNormal"),
+            NormalReaderState::FollowerNormal => write!(f, "FollowerNormal"),
             NormalReaderState::Initial => write!(f, "Initial"),
         }
     }
@@ -1858,6 +1897,7 @@ impl Client {
         ));
         let req_id = req.req_id;
         let mut req_clone = req.clone();
+        // FIXME: the selector state is not accurate. It is modified in the event function.
         let is_new_request = !self.pending_tasks.contains_key(&req.req_id);
         if is_new_request {
             self.pending_tasks
@@ -2021,8 +2061,8 @@ struct App {
     rate_exp_dist: Exp<f64>,
     // start_ts => transaction.
     pending_transactions: HashMap<Time, Transaction>,
-    read_staleness: Option<Time>,
-    num_region: u64,
+    enable_circuit_breaker: bool,
+    circuit_breaker: CircuitBreaker,
 
     // injection
     stop: bool,
@@ -2039,6 +2079,8 @@ struct App {
     read_only_ratio: f64,
     retry_with_leader_read: bool,
     enable_trace: bool,
+    num_region: u64,
+    read_staleness: Option<Time>,
 
     // metrics
     txn_duration_stat: Histogram<Time>,
@@ -2204,6 +2246,14 @@ impl App {
             rng: StdRng::from_seed(OsRng.gen()),
             rate_exp_dist: Exp::new(cfg.app_config.txn_rate).unwrap(),
             pending_transactions: HashMap::new(),
+            enable_circuit_breaker: cfg.app_config.circuit_breaker_config.enabled,
+            circuit_breaker: CircuitBreaker::new(
+                cfg.app_config.circuit_breaker_config.success_threshold,
+                cfg.app_config.circuit_breaker_config.failure_threshold,
+                cfg.app_config.circuit_breaker_config.half_open_tokens,
+                cfg.app_config.circuit_breaker_config.timeout,
+                now(),
+            ),
             txn_duration_stat: new_hist(),
             read_staleness: cfg.app_config.read_staleness,
             txn_rate: cfg.app_config.txn_rate,
@@ -2271,6 +2321,11 @@ impl App {
         txn.trace.borrow_mut().extend(req.trace.drain());
 
         if let Some(error) = error {
+            if self.enable_circuit_breaker && matches!(req.read_policy, ReadPolicy::Local,) {
+                // don't match req.selector_state as it is not correctly set.
+                self.circuit_breaker.record_failure(now());
+            }
+
             // if it has not been retried by the app, retry with leader read
             if self.retry_with_leader_read && matches!(req.read_policy, ReadPolicy::Local) {
                 // application retry immediately, using normal leader read
@@ -2315,6 +2370,10 @@ impl App {
                 );
             }
         } else {
+            if self.enable_circuit_breaker && matches!(req.read_policy, ReadPolicy::Local,) {
+                // don't match req.selector_state as it is not correctly set.
+                self.circuit_breaker.record_success();
+            }
             // success
             txn.trace.borrow_mut().record(format!(
                 "{}: app, received ok response for req {}",
@@ -2384,7 +2443,17 @@ impl App {
         }
     }
 
-    fn issue_request(&mut self, zone: Zone, req: Request, trace: Rc<RefCell<TransactionTrace>>) {
+    fn issue_request(
+        &mut self,
+        zone: Zone,
+        mut req: Request,
+        trace: Rc<RefCell<TransactionTrace>>,
+    ) {
+        if self.enable_circuit_breaker && !self.circuit_breaker.allow_request(now()) {
+            req.read_policy = ReadPolicy::Leader;
+            req.stale_read_ts = None;
+        }
+
         trace.borrow_mut().record(format!(
             "{}: app, sending req {}-{} to zone {}",
             now().pretty_print(),
