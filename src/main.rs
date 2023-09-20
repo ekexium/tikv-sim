@@ -101,7 +101,7 @@ struct ClientConfig {
 
 #[derive(Clone)]
 struct AppConfig {
-    retry: bool,
+    retry_with_leader_read: bool,
     // transactions per second
     txn_rate: f64,
     read_staleness: Option<Time>,
@@ -112,37 +112,16 @@ struct AppConfig {
     read_only_ratio: f64,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let events: Rc<RefCell<EventHeap>> = Rc::new(RefCell::new(EventHeap::new()));
-    let config = Config {
-        num_replica: 3,
-        num_region: 10000,
-        num_servers: 12,
-        max_time: 500 * SECOND,
-        metrics_interval: SECOND,
-        enable_trace: false,
-        server_config: ServerConfig {
-            enable_async_commit: true,
-            num_read_workers: 1,
-            num_write_workers: 1,
-            read_timeout: SECOND,
-            advance_interval: 5 * SECOND,
-            broadcast_interval: 5 * SECOND,
-        },
-        client_config: ClientConfig {
-            max_execution_time: 10 * SECOND,
-        },
-        app_config: AppConfig {
-            retry: false,
-            txn_rate: 1200.0,
-            read_staleness: Some(12 * SECOND),
-            read_size_fn: Rc::new(|| (rand::random::<u64>() % 5 + 1) * MILLISECOND),
-            prewrite_size_fn: Rc::new(|| (rand::random::<u64>() % 30 + 1) * MILLISECOND),
-            commit_size_fn: Rc::new(|| (rand::random::<u64>() % 20 + 1) * MILLISECOND),
-            num_queries_fn: Rc::new(|| 5),
-            read_only_ratio: 1.0,
-        },
-    };
+fn reset() {
+    M.reset();
+    TASK_COUNTER.store(0, atomic::Ordering::SeqCst);
+    EVENT_COUNTER.store(0, atomic::Ordering::SeqCst);
+    SERVER_COUNTER.store(0, atomic::Ordering::SeqCst);
+    CLIENT_COUNTER.store(0, atomic::Ordering::SeqCst);
+    CURRENT_TIME.store(0, atomic::Ordering::SeqCst);
+}
+
+fn run(config: &Config, chart_name: &str, server_ids_to_inject: &[usize]) {
     assert_eq!(config.metrics_interval, SECOND, "why bother");
     assert!(config.num_servers >= 3); // at least 1 server per AZ.
     assert_eq!(
@@ -150,23 +129,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "not supported yet, consider its match with AZs"
     );
 
-    let mut model = Model {
-        events: events.clone(),
-        num_replica: config.num_replica,
-        metrics_interval: config.metrics_interval,
-        servers: (0..config.num_servers)
-            .map(|id| Server::new(Zone::from_id(id), events.clone(), &config))
-            .collect(),
-        clients: vec![
-            Client::new(Zone::AZ1, events.clone(), &config),
-            Client::new(Zone::AZ2, events.clone(), &config),
-            Client::new(Zone::AZ3, events.clone(), &config),
-        ],
-        app: App::new(events.clone(), &config),
-    };
-    model.init(&config);
-    // model.inject_read_delay();
-    model.inject_high_pressure();
+    reset();
+    let events: Rc<RefCell<EventHeap>> = Rc::new(RefCell::new(EventHeap::new()));
+    let mut model = Model::new(events.clone(), &config);
+    model.inject_read_delay(server_ids_to_inject);
 
     let bar = ProgressBar::new(config.max_time / SECOND);
     loop {
@@ -188,14 +154,79 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (event.f)(&mut model);
     }
     bar.finish();
-    draw_metrics(&config)?;
+    draw_metrics(chart_name, &config).unwrap();
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut config = Config {
+        num_replica: 3,
+        num_region: 10000,
+        num_servers: 12,
+        max_time: 300 * SECOND,
+        metrics_interval: SECOND,
+        enable_trace: false,
+        server_config: ServerConfig {
+            enable_async_commit: true,
+            num_read_workers: 1,
+            num_write_workers: 1,
+            read_timeout: 100 * MILLISECOND,
+            advance_interval: 5 * SECOND,
+            broadcast_interval: 5 * SECOND,
+        },
+        client_config: ClientConfig {
+            max_execution_time: 400 * MILLISECOND,
+        },
+        app_config: AppConfig {
+            retry_with_leader_read: true,
+            txn_rate: 1300.0,
+            read_staleness: Some(12 * SECOND),
+            read_size_fn: Rc::new(|| (rand::random::<u64>() % 5 + 1) * MILLISECOND),
+            prewrite_size_fn: Rc::new(|| (rand::random::<u64>() % 30 + 1) * MILLISECOND),
+            commit_size_fn: Rc::new(|| (rand::random::<u64>() % 20 + 1) * MILLISECOND),
+            num_queries_fn: Rc::new(|| 5),
+            read_only_ratio: 1.0,
+        },
+    };
+
+    for txn_rate in [500.0] {
+        for server_ids_to_inject in [vec![0, 1, 2]] {
+            for max_execution_time in [
+                250 * MILLISECOND,
+                350 * MILLISECOND,
+                450 * MILLISECOND,
+                SECOND,
+            ] {
+                for retry in [false, true] {
+                    config.app_config.txn_rate = txn_rate;
+                    config.app_config.retry_with_leader_read = retry;
+                    config.client_config.max_execution_time = max_execution_time;
+                    println!(
+                        "running with txn_rate={}, server_ids_to_inject={:?}, max_execution_time={},retry={}",
+                        txn_rate, server_ids_to_inject, max_execution_time.pretty_print(), retry,
+                    );
+                    run(
+                        &config,
+                        &format!(
+                            "{}-{:?}-{}ms-retry={}.svg",
+                            txn_rate,
+                            server_ids_to_inject,
+                            max_execution_time / MILLISECOND,
+                            retry
+                        ),
+                        server_ids_to_inject.as_slice(),
+                    );
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
-fn draw_metrics(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
+fn draw_metrics(chart_name: &str, cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
     use plotters::prelude::*;
     let num_graphs = 20;
-    let root = SVGBackend::new("0.svg", (1200, num_graphs * 300)).into_drawing_area();
+    let root = SVGBackend::new(chart_name, (1400, num_graphs * 300)).into_drawing_area();
     let children_area = root.split_evenly(((num_graphs as usize + 1) / 2, 2));
     let font = ("Jetbrains Mono", 15).into_font();
     let colors = [
@@ -259,7 +290,7 @@ fn draw_metrics(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
     let app_ok_txn_duration = M
         .get_metric_group("app_txn_duration")
         .unwrap()
-        .filter_by_label(0, "ok");
+        .group_by_label(0, AggregateMethod::Sum);
     plot_chart(
         &cfg,
         &children_area,
@@ -267,7 +298,7 @@ fn draw_metrics(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
         colors,
         hist_count_opts,
         &mut chart_id,
-        "OK transaction rate",
+        "transaction throughput",
         app_ok_txn_duration,
         1,
         "",
@@ -678,6 +709,25 @@ struct Model {
 }
 
 impl Model {
+    fn new(events: Events, config: &Config) -> Self {
+        let mut model = Model {
+            events: events.clone(),
+            num_replica: config.num_replica,
+            metrics_interval: config.metrics_interval,
+            servers: (0..config.num_servers)
+                .map(|id| Server::new(Zone::from_id(id), events.clone(), &config))
+                .collect(),
+            clients: vec![
+                Client::new(Zone::AZ1, events.clone(), &config),
+                Client::new(Zone::AZ2, events.clone(), &config),
+                Client::new(Zone::AZ3, events.clone(), &config),
+            ],
+            app: App::new(events.clone(), &config),
+        };
+        model.init(&config);
+        model
+    }
+
     #[allow(unused)]
     fn inject_crashed_client(&mut self) {
         let region_id = 1;
@@ -697,6 +747,7 @@ impl Model {
                 let req = Request::new(
                     start_ts,
                     None,
+                    ReadPolicy::Local,
                     EventType::PrewriteRequest,
                     10 * MILLISECOND,
                     client.id,
@@ -715,6 +766,7 @@ impl Model {
                 let req = Request::new(
                     start_ts,
                     None,
+                    ReadPolicy::Local,
                     EventType::CommitRequest,
                     10 * MILLISECOND,
                     client.id,
@@ -732,34 +784,36 @@ impl Model {
             400 * SECOND,
             EventType::Injection,
             Box::new(move |model| {
-                model.app.retry = true;
+                model.app.retry_with_leader_read = true;
             }),
         ));
         self.events.borrow_mut().push(Event::new(
             600 * SECOND,
             EventType::Injection,
             Box::new(move |model| {
-                model.app.retry = false;
+                model.app.retry_with_leader_read = false;
             }),
         ));
     }
 
     #[allow(unused)]
-    fn inject_read_delay(&mut self) {
+    fn inject_read_delay(&mut self, server_ids: &[usize]) {
+        let server_ids_copied: Vec<_> = server_ids.iter().copied().collect();
         self.events.borrow_mut().push(Event::new(
             100 * SECOND,
             EventType::Injection,
             Box::new(move |model| {
-                for id in 0..3 {
-                    model.servers[id].read_delay = SECOND;
+                for id in server_ids_copied {
+                    model.servers[id].read_delay = 100 * MILLISECOND;
                 }
             }),
         ));
+        let server_ids_copied: Vec<_> = server_ids.iter().copied().collect();
         self.events.borrow_mut().push(Event::new(
             150 * SECOND,
             EventType::Injection,
             Box::new(move |model| {
-                for id in 0..3 {
+                for id in server_ids_copied {
                     model.servers[id].read_delay = 0;
                 }
             }),
@@ -1217,7 +1271,7 @@ impl Server {
 
         let task_size = req.size + self.read_delay;
         let stale_read_ts = req.stale_read_ts;
-        let is_retry = req.selector_state.ignore_read_timeout();
+        let ignore_read_timeout = req.selector_state.ignore_read_timeout();
         self.read_workers[worker_id] = Some((now(), req));
         let this_server_id = self.server_id;
 
@@ -1262,7 +1316,7 @@ impl Server {
         );
 
         // timeout check
-        if !is_retry && accept_time + self.read_timeout < now() + task_size {
+        if !ignore_read_timeout && accept_time + self.read_timeout <= now() + task_size {
             // will timeout. It tries for until timeout, and then decide to abort.
             self.events.borrow_mut().push(Event::new(
                 max(accept_time + self.read_timeout, now()),
@@ -1551,7 +1605,12 @@ impl PeerSelector {
             PeerSelectorStateType::Unknown => unreachable!(),
             PeerSelectorStateType::StaleRead(s) => match s {
                 StaleReaderState::Initial => {
-                    *s = StaleReaderState::LocalStale;
+                    match req.read_policy {
+                        ReadPolicy::Leader => {
+                            unreachable!("doesn't make sense to have leader stale read")
+                        }
+                        ReadPolicy::Local => *s = StaleReaderState::LocalStale,
+                    }
                     assert!(req.stale_read_ts.is_some());
                     true
                 }
@@ -1594,7 +1653,10 @@ impl PeerSelector {
             },
             PeerSelectorStateType::NormalRead(s) => match s {
                 NormalReaderState::Initial => {
-                    *s = NormalReaderState::Local;
+                    match req.read_policy {
+                        ReadPolicy::Local => *s = NormalReaderState::Local,
+                        ReadPolicy::Leader => *s = NormalReaderState::LeaderNormal,
+                    }
                     true
                 }
                 NormalReaderState::Local => {
@@ -1620,7 +1682,10 @@ impl PeerSelector {
                     let num_followers = Model::find_followers_by_id(servers, req.region_id).len();
                     if self.server_ids_tried_for_normal_read.len() == num_followers + 1 {
                         assert_eq!(self.state.round, 0, "round > 0, should not fail");
-                        *s = NormalReaderState::Local;
+                        match req.read_policy {
+                            ReadPolicy::Local => *s = NormalReaderState::Local,
+                            ReadPolicy::Leader => *s = NormalReaderState::LeaderNormal,
+                        }
                         self.state.round += 1;
                         self.server_ids_tried_for_normal_read.clear();
                         true
@@ -1965,13 +2030,14 @@ struct App {
     txn_interval_adjust_value: i64,
 
     // configs
+    #[allow(unused)]
     txn_rate: f64,
     read_size_fn: Rc<dyn Fn() -> Time>,
     prewrite_size_fn: Rc<dyn Fn() -> Time>,
     commit_size_fn: Rc<dyn Fn() -> Time>,
     num_queries_fn: Rc<dyn Fn() -> u64>,
     read_only_ratio: f64,
-    retry: bool,
+    retry_with_leader_read: bool,
     enable_trace: bool,
 
     // metrics
@@ -2071,6 +2137,7 @@ impl Transaction {
             remaining_queries.push_back(Request::new(
                 start_ts,
                 stale_read_ts,
+                ReadPolicy::Local,
                 EventType::ReadRequest,
                 read_size_fn(),
                 u64::MAX,
@@ -2084,6 +2151,7 @@ impl Transaction {
             prewrite_req = Some(Request::new(
                 start_ts,
                 None,
+                ReadPolicy::Local,
                 EventType::PrewriteRequest,
                 prewrite_size_fn(),
                 u64::MAX,
@@ -2093,6 +2161,7 @@ impl Transaction {
             commit_req = Some(Request::new(
                 start_ts,
                 None,
+                ReadPolicy::Local,
                 EventType::CommitRequest,
                 commit_size_fn(),
                 u64::MAX,
@@ -2144,7 +2213,7 @@ impl App {
             commit_size_fn: cfg.app_config.commit_size_fn.clone(),
             num_queries_fn: cfg.app_config.num_queries_fn.clone(),
             read_only_ratio: cfg.app_config.read_only_ratio,
-            retry: cfg.app_config.retry,
+            retry_with_leader_read: cfg.app_config.retry_with_leader_read,
             enable_trace: cfg.enable_trace,
             txn_interval_adjust_value: 0,
         }
@@ -2202,8 +2271,9 @@ impl App {
         txn.trace.borrow_mut().extend(req.trace.drain());
 
         if let Some(error) = error {
-            if self.retry {
-                // application retry immediately
+            // if it has not been retried by the app, retry with leader read
+            if self.retry_with_leader_read && matches!(req.read_policy, ReadPolicy::Local) {
+                // application retry immediately, using normal leader read
                 txn.trace.borrow_mut().record(format!(
                     "{}: app, retrying from app side, error: {}",
                     now().pretty_print(),
@@ -2214,7 +2284,8 @@ impl App {
                 let trace = txn.trace.clone();
                 let retry_req = Request::new(
                     req.start_ts,
-                    req.stale_read_ts,
+                    None,
+                    ReadPolicy::Leader,
                     req.req_type,
                     req.size,
                     req.client_id,
@@ -2363,6 +2434,12 @@ impl RequestTrace {
     }
 }
 
+#[derive(Clone)]
+enum ReadPolicy {
+    Local,
+    Leader,
+}
+
 // a request, its content are permanent and immutable, even if it's sent to multiple servers.
 #[derive(Clone)]
 struct Request {
@@ -2374,8 +2451,10 @@ struct Request {
     // the time needed to finish the task, in microsecond
     size: Time,
     region_id: u64,
+    read_policy: ReadPolicy,
 
     // metrics
+    // the state is set by client, used for metrics in server-side
     selector_state: PeerSelectorState,
     trace: RequestTrace,
 }
@@ -2384,6 +2463,7 @@ impl Request {
     fn new(
         start_ts: u64,
         stale_read_ts: Option<u64>,
+        read_policy: ReadPolicy,
         req_type: EventType,
         size: Time,
         client_id: u64,
@@ -2401,6 +2481,7 @@ impl Request {
         Self {
             start_ts,
             stale_read_ts,
+            read_policy,
             req_type,
             req_id,
             client_id,

@@ -459,6 +459,11 @@ impl MetricsRecorder {
         }
     }
 
+    pub fn reset(&self) {
+        let mut data = self.data.lock().unwrap();
+        data.metric_group.clear();
+    }
+
     // Record a metric with labels
     pub fn record_hist(&self, name: &str, label: Label, value: u64) {
         let bucket = now() / TIME_BUCKET_RANGE;
